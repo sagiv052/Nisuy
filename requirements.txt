@@ -1,0 +1,8 @@
+python-telegram-bot
+requests
+beautifulsoup4
+playwright
+flask
+gunicorn
+uvicorn
+python-dotenv
