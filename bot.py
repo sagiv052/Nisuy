@@ -43,7 +43,7 @@ def keep_alive():
 
 # Bot Logic
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU")
-CREDIT_LINE = "💎 *הוכן והועלה על ידי אלון נושם באהבה* 👑"
+CREDIT_LINE = "💎 הוכן והועלה על ידי אלון נושם באהבה 👑"
 
 # Main Menu UI
 def get_main_menu():
@@ -99,7 +99,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1️⃣ העתיקו קישור לתיקיית Google Drive ציבורית.\n"
             "2️⃣ ניתן לשלוח מספר קישורים בהודעה אחת.\n"
             "3️⃣ הבוט יסרוק את כל הקבצים ותיקיות המשנה.\n"
-            "4️⃣ בסיום תקבלו הודעה לכל סדרה וקובץ סיכום אחד לכולן. 📄"
+            "4️⃣ בסיום תקבלו הודעה עם כל הקישורים (אם הרשימה קצרה) או קובץ סיכום (אם הרשימה ארוכה). 📄"
         )
         await query.edit_message_text(
             f"{usage_text}\n\n{CREDIT_LINE}", 
@@ -151,6 +151,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_episodes_all = 0
     consolidated_content = ""
     series_details = []
+    all_series_messages = []
+    total_msg_length = 0
+    
     loop = asyncio.get_event_loop()
 
     for i, link in enumerate(links, 1):
@@ -184,7 +187,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for res in results:
             if "error" in res:
                 fail_count += 1
-                series_details.append(f"❌ שגיאה: {res['error']}")
+                title = res.get('title', 'סדרה לא ידועה')
+                series_details.append(f"❌ • • {title}: שגיאה ({res['error']})")
                 continue
             
             success_count += 1
@@ -193,52 +197,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats = res['stats']
             total_episodes_all += stats['total_episodes']
             
-            series_details.append(f"✅ {title}: {stats['total_episodes']} פרקים")
+            series_details.append(f"✅ • • {title}: {stats['total_episodes']} פרקים")
             consolidated_content += f"🎬 סדרה: {title}\n"
             
-            # Individual message for this series
-            msg_output = f"🎬 **{title}**\n\n"
+            # Individual message content for this series
+            msg_output = f"🎥 **{title}**\n\n"
             for season, episodes in data.items():
-                msg_output += f"📂 **{season}:**\n"
+                msg_output += f"📂 **{season}**\n"
                 consolidated_content += f"{season}\n"
                 for ep in episodes:
                     ep_num = ep['episode'] if ep['episode'] is not None else "כללי"
-                    line = f"• פרק {ep_num}: {ep['url']}"
-                    msg_output += f"{line}\n"
-                    consolidated_content += f"{line}\n"
+                    line_header = f"פרק {ep_num}"
+                    line_url = f"{ep['url']}"
+                    msg_output += f"{line_header}\n{line_url}\n"
+                    consolidated_content += f"{line_header}\n{line_url}\n"
                 msg_output += "\n"
                 consolidated_content += "\n"
             
             consolidated_content += "-"*20 + "\n\n"
-            msg_output += f"\n{CREDIT_LINE}"
             
-            # Send individual message
-            try:
-                if len(msg_output) > 4000:
-                    for part in [msg_output[k:k+4000] for k in range(0, len(msg_output), 4000)]:
-                        await update.message.reply_text(part, parse_mode='Markdown', disable_web_page_preview=False)
-                else:
-                    await update.message.reply_text(msg_output, parse_mode='Markdown', disable_web_page_preview=False)
-            except Exception as e:
-                logger.error(f"Error sending series message: {e}")
+            # Store message for potential combined sending
+            all_series_messages.append(msg_output)
+            total_msg_length += len(msg_output) + len(CREDIT_LINE) + 5 # Add margin for separators
 
     # Final summary
     summary_text = "🎊 **העבודה הסתיימה בהצלחה!** 🏁\n\n"
     summary_text += f"✅ סדרות שחולצו: {success_count}\n"
-    if fail_count > 0:
-        summary_text += f"⚠️ קישורים שנכשלו: {fail_count}\n"
+    summary_text += f"❌ סדרות שנכשלו: {fail_count}\n"
     summary_text += f"📦 סה\"כ פרקים: {total_episodes_all}\n\n"
     summary_text += "📝 **פירוט:**\n" + "\n".join(series_details) + "\n\n"
+    
+    if total_msg_length > 4000:
+        summary_text += "⚠️ **רשימת הקישורים ארוכה מדי להודעה, היא מצורפת בקובץ הטקסט למטה.** 📄\n\n"
+    
     summary_text += CREDIT_LINE
     
-    # Send final summary as a NEW message to avoid collisions with progress bar
+    # Send final summary
     try:
-        # Try to delete the progress message to clean up, then send summary
         await status_msg.delete()
     except: pass
     
     await update.message.reply_text(summary_text, parse_mode='Markdown')
     
+    # Send series links as message if they fit
+    if success_count > 0 and total_msg_length <= 4000:
+        combined_msg = "\n".join(all_series_messages) + f"\n{CREDIT_LINE}"
+        try:
+            await update.message.reply_text(combined_msg, parse_mode='Markdown', disable_web_page_preview=False)
+        except Exception as e:
+            logger.error(f"Error sending combined series message: {e}")
+            await update.message.reply_text(combined_msg.replace('*', '').replace('_', ''), disable_web_page_preview=False)
+
     # Send consolidated file
     if success_count > 0:
         file_stream = io.BytesIO(consolidated_content.encode('utf-8'))

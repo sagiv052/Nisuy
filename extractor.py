@@ -138,13 +138,12 @@ class DriveExtractor:
                 except: pass
         return files, subfolders
 
-    def scan_recursive(self, folder_id: str, depth=0, max_depth=5) -> List[Tuple[str, str]]:
+    def scan_recursive(self, folder_id: str, depth=0, max_depth=10) -> List[Tuple[str, str]]:
         if depth > max_depth: return []
         
         content, err = self.get_html(folder_id)
         if not content: return []
         
-        # Use a more memory-efficient way to find folder name
         folder_name = "תיקייה"
         title_start = content.find('<title>')
         title_end = content.find('</title>')
@@ -157,8 +156,8 @@ class DriveExtractor:
         files, subfolders = self.parse_content(content)
         all_files = files
         
-        # Limit total subfolders to prevent infinite loops or extreme memory usage
-        for sf_id in subfolders[:50]: 
+        # NO LIMIT on subfolders
+        for sf_id in subfolders: 
             if sf_id != folder_id:
                 if self.progress_callback: self.progress_callback(f"📂 נכנס לתיקיית משנה...")
                 all_files.extend(self.scan_recursive(sf_id, depth + 1, max_depth))
@@ -173,29 +172,27 @@ class DriveExtractor:
 
         if self.progress_callback: self.progress_callback("📡 מתחבר ל-Google Drive...")
         
-        # Get initial content
         content, err = self.get_html(folder_id)
         if not content:
             return [{"error": err or "לא ניתן לגשת לתיקייה. וודא שהיא ציבורית."}]
             
         files, subfolders = self.parse_content(content)
         
-        # LOGIC: If there are subfolders and very few/no files in the root, 
-        # treat each subfolder as a separate series.
         if subfolders and len(files) < 5:
             if self.progress_callback: self.progress_callback(f"📂 זיהיתי {len(subfolders)} סדרות בתיקייה. מתחיל בחילוץ פרטני...")
             all_series_results = []
-            for sf_id in subfolders[:30]: # Limit to 30 series per parent folder
+            # NO LIMIT on series count
+            for sf_id in subfolders: 
                 res = self.process_single_folder(sf_id)
                 if "error" not in res:
                     all_series_results.append(res)
+                else:
+                    all_series_results.append({"title": f"שגיאה בתיקייה {sf_id}", "error": res["error"]})
             return all_series_results
         else:
-            # Treat the whole folder as one series
             return [self.process_single_folder(folder_id)]
 
     def process_single_folder(self, folder_id: str) -> Dict[str, Any]:
-        # Helper to process a folder as a single series
         content, err = self.get_html(folder_id)
         if not content: return {"error": err or "שגיאה בגישה לתיקייה"}
         
@@ -207,13 +204,12 @@ class DriveExtractor:
 
         all_entries = self.scan_recursive(folder_id)
         if not all_entries: 
-            return {"error": "לא נמצאו קבצים בתיקייה. וודא שיש בה קבצי וידאו והיא פתוחה לצפייה."}
+            return {"error": "לא נמצאו קבצים בתיקייה", "title": folder_title}
 
         grouped = {}
         total_episodes = 0
         total_count = len(all_entries)
         
-        # Use a more efficient grouping for large datasets
         for idx, (raw_name, url) in enumerate(all_entries, 1):
             if self.progress_callback and (idx % 20 == 0 or idx == total_count):
                 self.progress_callback(f"⚙️ מעבד קובץ {idx} מתוך {total_count}...", current=idx, total=total_count)
@@ -225,7 +221,6 @@ class DriveExtractor:
             s_key = f"עונה {season}" if season else "כללי"
             if s_key not in grouped: grouped[s_key] = []
             
-            # Duplicate check
             is_duplicate = False
             for existing in grouped[s_key]:
                 if existing['episode'] == episode and episode is not None:
