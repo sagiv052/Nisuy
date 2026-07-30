@@ -8,32 +8,56 @@ import requests
 import time
 import html
 import re
+import sys
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from extractor import DriveExtractor, DRIVE_URL_PATTERN
 
 # Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
 
 # Flask for Render Health Check
 app = Flask(__name__)
+
 @app.route('/')
-def health(): return "Bot is running! 🚀"
+def health():
+    return "Bot is alive and kicking! 🚀", 200
+
+@app.route('/ping')
+def ping():
+    return "pong", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    logger.info(f"Starting Flask server on port {port}...")
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"Flask server failed: {e}")
 
-# Keep-Alive Mechanism
+# Improved Keep-Alive Mechanism
 def keep_alive():
+    # Try to get the URL from env, or log that it's missing
     url = os.environ.get("BOT_URL")
-    if not url: return
+    if not url:
+        logger.warning("BOT_URL not set! Keep-alive might not work on Render Free Tier.")
+        return
+    
+    logger.info(f"Starting keep-alive pings to {url}...")
     while True:
-        try: requests.get(url, timeout=10)
-        except: pass
-        time.sleep(600)
+        try:
+            # Ping every 5 minutes (Render sleeps after 15)
+            r = requests.get(url, timeout=20)
+            logger.info(f"Keep-alive ping status: {r.status_code}")
+        except Exception as e:
+            logger.error(f"Keep-alive ping failed: {e}")
+        time.sleep(300)
 
 # Bot Config
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU")
@@ -41,13 +65,16 @@ CREDIT_LINE = "💎 הוכן והועלה על ידי אלון נושם באהב
 
 def get_main_menu():
     text = (
-        "✨ **מערכת חילוץ סדרות מתקדמת v3.1** ✨\n\n"
+        "✨ **מערכת חילוץ סדרות מתקדמת v3.2** ✨\n\n"
         "🚀 **ביצועים:** סריקה מקבילית (10 Workers)\n"
         "🛡️ **חסינות:** 22 זהויות דפדפן משתנות\n"
         "📂 **תמיכה:** תיקיות, תת-תיקיות וקבצים בודדים\n\n"
         "📥 **שלחו קישור או קובץ טקסט כדי להתחיל:**"
     )
-    keyboard = [[InlineKeyboardButton("עזרה ❓", callback_data='help'), InlineKeyboardButton("איך להשתמש 🛠️", callback_data='usage')]]
+    keyboard = [[
+        InlineKeyboardButton("עזרה ❓", callback_data='help'), 
+        InlineKeyboardButton("איך להשתמש 🛠️", callback_data='usage')
+    ]]
     return f"{text}\n\n{CREDIT_LINE}", InlineKeyboardMarkup(keyboard)
 
 active_tasks = {}
@@ -80,8 +107,6 @@ def format_time(seconds):
 def get_progress_display(msg, current, total_links, current_link_idx, start_time):
     elapsed = time.time() - start_time
     bar_len = 10
-    
-    # Estimate progress
     progress_val = min(current / 50.0, 1.0) if current else 0
     filled = int(bar_len * progress_val)
     bar = '🟢' * filled + '⚪' * (bar_len - filled)
@@ -125,7 +150,6 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     process_start_time = time.time()
     loop = asyncio.get_event_loop()
     
-    # Phase 1: Pre-scan
     all_targets = []
     for i, link in enumerate(links, 1):
         if not active_tasks.get(user_id, True): break
@@ -138,7 +162,6 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
             logger.error(f"Pre-scan error: {e}")
             all_targets.append(link)
 
-    # Phase 2: Extract
     all_results = []
     total_targets = len(all_targets)
     for idx, target in enumerate(all_targets, 1):
@@ -161,7 +184,6 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
             logger.error(f"Extraction error: {e}")
             all_results.append({"error": str(e), "title": "שגיאה"})
 
-    # Consolidation
     consolidated = {}
     success, fail, total_eps = 0, 0, 0
     details = []
@@ -180,7 +202,6 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
                     consolidated[title]['data'][s].append(e)
                     consolidated[title]['eps'] += 1
     
-    # Final Output
     report = f"🎊 **העבודה הושלמה!** 🏁\n\n"
     final_txt = ""
     series_msgs = []
@@ -225,14 +246,28 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     active_tasks.pop(user_id, None)
 
 def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=keep_alive, daemon=True).start()
-    app_tg = Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start))
-    app_tg.add_handler(CallbackQueryHandler(handle_callback))
-    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app_tg.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
-    logger.info("Bot started...")
-    app_tg.run_polling()
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Start keep-alive in a separate thread
+    keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+    keep_alive_thread.start()
+    
+    # Start Telegram Bot
+    try:
+        logger.info("Initializing Telegram Bot...")
+        app_tg = Application.builder().token(TOKEN).build()
+        app_tg.add_handler(CommandHandler("start", start))
+        app_tg.add_handler(CallbackQueryHandler(handle_callback))
+        app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        app_tg.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+        
+        logger.info("Bot is starting polling...")
+        app_tg.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        logger.critical(f"Bot crashed: {e}")
+        sys.exit(1)
 
-if __name__ == '__main__': main()
+if __name__ == '__main__':
+    main()
