@@ -35,6 +35,8 @@ def detect_quality(name: str) -> str:
 
 def clean_series_name(title: str) -> str:
     if not title: return ''
+    # Unescape HTML entities like & 39;
+    title = html.unescape(title)
     title = EMOJI_PATTERN.sub('', title)
     title = re.sub(r'\.(?:mp4|mkv|avi|pdf|zip|rar|txt|jpg|jpeg|png|gif|webm|mov|srt)\b', '', title, flags=re.IGNORECASE)
     
@@ -72,7 +74,7 @@ def extract_folder_id(input_str: str) -> str:
     raise ValueError(f"קישור לא תקין. וודא שהעתקת את הקישור המלא מהדפדפן.")
 
 def parse_season_episode(name: str) -> Tuple[Optional[int], Optional[int]]:
-    name = name.replace('_', ' ').strip()
+    name = html.unescape(name.replace('_', ' ')).strip()
     patterns = [
         r'[Ss](\d+)[Ee](\d+)',
         r'(?:עונה|ע)\s*(\d+)\s*(?:[-–—:|/\\]?\s*)?(?:פרק|פ)\s*(\d+)',
@@ -101,17 +103,16 @@ class DriveExtractor:
     def get_html(self, folder_id: str) -> Tuple[Optional[str], Optional[str]]:
         url = f'https://drive.google.com/embeddedfolderview?id={folder_id}#grid'
         try:
-            # Add a tiny random jitter to avoid being flagged by Google
             time.sleep(random.uniform(0.1, 0.3))
             response = self.session.get(url, timeout=20)
             if response.status_code == 404:
                 return None, "התיקייה לא נמצאה. ייתכן שהקישור שבור."
             if response.status_code == 403:
-                return None, "אין גישה לתיקייה. וודא שהיא מוגדרת כציבורית ('כל מי שקיבל את הקישור')."
+                return None, "אין גישה לתיקייה. וודא שהיא מוגדרת כציבורית."
             response.raise_for_status()
             return response.text, None
         except requests.exceptions.Timeout:
-            return None, "החיבור לשרת Google Drive התעכב יותר מדי. נסה שוב בעוד רגע."
+            return None, "החיבור לשרת Google Drive התעכב יותר מדי."
         except Exception as e:
             return None, f"שגיאת תקשורת: {str(e)}"
 
@@ -148,7 +149,7 @@ class DriveExtractor:
         title_start = content.find('<title>')
         title_end = content.find('</title>')
         if title_start != -1 and title_end != -1:
-            folder_name = content[title_start+7:title_end].replace(' - Google Drive', '')
+            folder_name = html.unescape(content[title_start+7:title_end].replace(' - Google Drive', ''))
 
         if self.progress_callback: 
             self.progress_callback(f"🔍 סורק: {folder_name} (עומק {depth})")
@@ -156,10 +157,8 @@ class DriveExtractor:
         files, subfolders = self.parse_content(content)
         all_files = files
         
-        # NO LIMIT on subfolders
         for sf_id in subfolders: 
             if sf_id != folder_id:
-                if self.progress_callback: self.progress_callback(f"📂 נכנס לתיקיית משנה...")
                 all_files.extend(self.scan_recursive(sf_id, depth + 1, max_depth))
         
         return all_files
@@ -174,14 +173,13 @@ class DriveExtractor:
         
         content, err = self.get_html(folder_id)
         if not content:
-            return [{"error": err or "לא ניתן לגשת לתיקייה. וודא שהיא ציבורית."}]
+            return [{"error": err or "לא ניתן לגשת לתיקייה."}]
             
         files, subfolders = self.parse_content(content)
         
         if subfolders and len(files) < 5:
-            if self.progress_callback: self.progress_callback(f"📂 זיהיתי {len(subfolders)} סדרות בתיקייה. מתחיל בחילוץ פרטני...")
+            if self.progress_callback: self.progress_callback(f"📂 זיהיתי {len(subfolders)} סדרות בתיקייה...")
             all_series_results = []
-            # NO LIMIT on series count
             for sf_id in subfolders: 
                 res = self.process_single_folder(sf_id)
                 if "error" not in res:
