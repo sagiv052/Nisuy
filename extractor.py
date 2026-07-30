@@ -2,8 +2,7 @@ import re
 import html
 import time
 import random
-import urllib.request
-import urllib.error
+import requests
 from typing import List, Tuple, Optional, Dict, Set, Any
 from bs4 import BeautifulSoup
 
@@ -94,14 +93,17 @@ class DriveExtractor:
     def __init__(self, progress_callback=None):
         self.progress_callback = progress_callback
         self.seen_files = set()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+        })
 
     def get_html(self, folder_id: str) -> Tuple[Optional[str], Optional[str]]:
         url = f'https://drive.google.com/embeddedfolderview?id={folder_id}#grid'
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'}
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as response:
-                return response.read().decode('utf-8', errors='ignore'), None
+            response = self.session.get(url, timeout=20)
+            response.raise_for_status()
+            return response.text, None
         except Exception as e:
             return None, str(e)
 
@@ -112,7 +114,11 @@ class DriveExtractor:
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/file/d/' in href:
-                title = a.get_text().strip() or (a.find_parent('div').get_text().strip() if a.find_parent('div') else "")
+                title = a.get_text().strip()
+                if not title:
+                    parent = a.find_parent('div')
+                    title = parent.get_text().strip() if parent else "קובץ ללא שם"
+                
                 if href.startswith('/'): href = f"https://drive.google.com{href}"
                 if href not in self.seen_files:
                     self.seen_files.add(href)
@@ -126,7 +132,7 @@ class DriveExtractor:
 
     def scan_recursive(self, folder_id: str, depth=0, max_depth=3) -> List[Tuple[str, str]]:
         if depth > max_depth: return []
-        if self.progress_callback: self.progress_callback(f"סורק תיקייה... (עומק {depth})")
+        if self.progress_callback: self.progress_callback(f"🔍 סורק תיקייה... (עומק {depth})")
         
         content, err = self.get_html(folder_id)
         if not content: return []
@@ -146,17 +152,25 @@ class DriveExtractor:
             folder_id = extract_folder_id(folder_url)
         except ValueError as e: return {"error": str(e)}
 
+        if self.progress_callback: self.progress_callback("📡 מתחבר ל-Google Drive...")
+        
         # Get initial title
-        content, _ = self.get_html(folder_id)
+        content, err = self.get_html(folder_id)
+        if not content:
+            return {"error": f"לא ניתן לגשת לתיקייה. וודא שהיא ציבורית. ({err})"}
+            
         folder_title = "סדרה ללא שם"
-        if content:
-            soup = BeautifulSoup(content, 'html.parser')
-            title_tag = soup.find('title')
-            if title_tag: folder_title = clean_series_name(title_tag.get_text().replace(' - Google Drive', ''))
+        soup = BeautifulSoup(content, 'html.parser')
+        title_tag = soup.find('title')
+        if title_tag: 
+            folder_title = clean_series_name(title_tag.get_text().replace(' - Google Drive', ''))
 
         # Recursive scan
         all_entries = self.scan_recursive(folder_id)
-        if not all_entries: return {"error": "לא נמצאו קבצים. וודא שהתיקייה ציבורית."}
+        if not all_entries: 
+            return {"error": "לא נמצאו קבצים בתיקייה. וודא שיש בה קבצי וידאו והיא פתוחה לצפייה."}
+
+        if self.progress_callback: self.progress_callback(f"⚙️ מעבד {len(all_entries)} קבצים שנמצאו...")
 
         grouped = {}
         total_episodes = 0
@@ -168,7 +182,7 @@ class DriveExtractor:
             s_key = f"עונה {season}" if season else "כללי"
             if s_key not in grouped: grouped[s_key] = []
             
-            # Duplicate check: if same episode exists, keep it or handle
+            # Duplicate check
             is_duplicate = False
             for existing in grouped[s_key]:
                 if existing['episode'] == episode and episode is not None:
