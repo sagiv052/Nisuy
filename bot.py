@@ -76,17 +76,22 @@ def format_time(seconds):
     if seconds < 60: return f"{int(seconds)} שניות"
     return f"{int(seconds // 60)} דקות ו-{int(seconds % 60)} שניות"
 
-def get_progress_bar(current, total, start_time):
-    percentage = (current / total) * 100
-    filled = int(15 * current // total)
-    bar = '█' * filled + '░' * (15 - filled)
+def get_progress_display(msg, current, total, start_time):
     elapsed = time.time() - start_time
-    if current > 0:
-        remaining = (elapsed / current) * total - elapsed
-        time_info = f"\n⏱ **זמן שעבר:** {format_time(elapsed)}\n⏳ **זמן משוער לסיום:** {format_time(remaining)}"
+    time_info = f"\n⏱ **זמן שעבר:** {format_time(elapsed)}"
+    
+    if current is not None and total is not None and total > 0:
+        percentage = (current / total) * 100
+        filled = int(15 * current // total)
+        bar = '█' * filled + '░' * (15 - filled)
+        remaining = (elapsed / current) * total - elapsed if current > 0 else 0
+        if current > 0:
+            time_info += f"\n⏳ **זמן משוער לסיום:** {format_time(remaining)}"
+        else:
+            time_info += f"\n⏳ **מחשב זמן...**"
+        return f"{msg}\n\n|{bar}| {percentage:.1f}%{time_info}"
     else:
-        time_info = f"\n⏱ **זמן שעבר:** {format_time(elapsed)}\n⏳ **מחשב זמן...**"
-    return f"|{bar}| {percentage:.1f}%{time_info}"
+        return f"{msg}\n\n{time_info}"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_links(update, context, update.message.text)
@@ -110,7 +115,7 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     user_id = update.message.from_user.id
     links = DRIVE_URL_PATTERN.findall(text)
     if not links:
-        if update.message.document: # If it was a file but no links found
+        if update.message.document:
             await update.message.reply_text("❌ **לא נמצאו קישורי Google Drive בקובץ.**")
         return
 
@@ -123,44 +128,81 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     process_start_time = time.time()
     loop = asyncio.get_event_loop()
 
+    # Phase 1: Pre-scan to count total series across all links
+    total_series_to_process = 0
+    all_links_data = [] # List of (is_multi, folder_id_or_results)
+    
     for i, link in enumerate(links, 1):
         if not active_tasks.get(user_id, True): break
-        last_update = [0]
-        def progress(msg, current=None, total=None):
-            if time.time() - last_update[0] < 3.0 and current is not None: return
-            last_update[0] = time.time()
+        
+        def pre_scan_progress(msg, current=None, total=None):
             try:
-                display = f"🔄 **מעבד {i}/{len(links)}...**\n{msg}"
-                if current and total: display += f"\n\n{get_progress_bar(current, total, process_start_time)}"
+                display = f"🔍 **סורק קישור {i}/{len(links)}...**\n{msg}\n\n⏱ **זמן שעבר:** {format_time(time.time() - process_start_time)}"
                 asyncio.run_coroutine_threadsafe(status_msg.edit_text(display, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]])), loop)
             except: pass
 
-        extractor = DriveExtractor(progress_callback=progress)
-        results = await loop.run_in_executor(None, extractor.extract_series, link)
+        extractor = DriveExtractor(progress_callback=pre_scan_progress)
+        # Use a custom method to just get the list of folders/series without full extraction yet
+        series_list = await loop.run_in_executor(None, extractor.get_series_list, link)
         
-        for res in results:
-            if "error" in res:
-                fail_count += 1
-                series_details.append(f"❌ • • {res.get('title', 'סדרה לא ידועה')}: שגיאה ({res['error']})")
-                continue
-            success_count += 1
-            title, data, stats = res['title'], res['data'], res['stats']
-            total_episodes_all += stats['total_episodes']
-            series_details.append(f"✅ • • {title}: {stats['total_episodes']} פרקים")
-            consolidated_content += f"🎬 סדרה: {title}\n"
-            msg_output = f"🎥 **{title}**\n\n"
-            for season, episodes in data.items():
-                msg_output += f"📂 **{season}**\n"
-                consolidated_content += f"{season}\n"
-                for ep in episodes:
-                    line = f"פרק {ep['episode'] if ep['episode'] is not None else 'כללי'}\n{ep['url']}\n"
-                    msg_output += line
-                    consolidated_content += line
-                msg_output += "\n"
-                consolidated_content += "\n"
-            consolidated_content += "-"*20 + "\n\n"
-            all_series_messages.append(msg_output)
-            total_msg_length += len(msg_output) + 50
+        if isinstance(series_list, list) and len(series_list) > 0 and "error" not in series_list[0]:
+            total_series_to_process += len(series_list)
+            all_links_data.append(series_list)
+        else:
+            # It's an error or a single folder that couldn't be listed
+            total_series_to_process += 1
+            all_links_data.append([link])
+
+    # Phase 2: Actual extraction with accurate counter
+    current_series_index = 0
+    for link_data in all_links_data:
+        if not active_tasks.get(user_id, True): break
+        
+        for item in link_data:
+            if not active_tasks.get(user_id, True): break
+            current_series_index += 1
+            last_update = [0]
+            
+            def progress(msg, current=None, total=None):
+                if time.time() - last_update[0] < 2.0 and current is not None: return
+                last_update[0] = time.time()
+                try:
+                    header = f"🔄 **מעבד סדרה {current_series_index}/{total_series_to_process}...**"
+                    display = get_progress_display(f"{header}\n{msg}", current, total, process_start_time)
+                    asyncio.run_coroutine_threadsafe(
+                        status_msg.edit_text(display, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]])), 
+                        loop
+                    )
+                except: pass
+
+            extractor = DriveExtractor(progress_callback=progress)
+            # If item is a string, it's a URL/ID. If it's a dict, it might be pre-fetched info.
+            target = item if isinstance(item, str) else item.get('id', link)
+            results = await loop.run_in_executor(None, extractor.extract_series, target)
+            
+            for res in results:
+                if "error" in res:
+                    fail_count += 1
+                    series_details.append(f"❌ • • {res.get('title', 'סדרה לא ידועה')}: שגיאה ({res['error']})")
+                    continue
+                success_count += 1
+                title, data, stats = res['title'], res['data'], res['stats']
+                total_episodes_all += stats['total_episodes']
+                series_details.append(f"✅ • • {title}: {stats['total_episodes']} פרקים")
+                consolidated_content += f"🎬 סדרה: {title}\n"
+                msg_output = f"🎥 **{title}**\n\n"
+                for season, episodes in data.items():
+                    msg_output += f"📂 **{season}**\n"
+                    consolidated_content += f"{season}\n"
+                    for ep in episodes:
+                        line = f"פרק {ep['episode'] if ep['episode'] is not None else 'כללי'}\n{ep['url']}\n"
+                        msg_output += line
+                        consolidated_content += line
+                    msg_output += "\n"
+                    consolidated_content += "\n"
+                consolidated_content += "-"*20 + "\n\n"
+                all_series_messages.append(msg_output)
+                total_msg_length += len(msg_output) + 50
 
     # Prepare final delivery
     base_summary = f"🎊 <b>העבודה הסתיימה בהצלחה!</b> 🏁\n\n✅ סדרות שחולצו: {success_count}\n❌ סדרות שנכשלו: {fail_count}\n📦 סה\"כ פרקים: {total_episodes_all}\n\n"
@@ -174,22 +216,16 @@ async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text
     else:
         summary_to_send = full_report
 
-    # DELIVERY PHASE - Using a safe try-except to ensure we don't "disappear"
     try:
-        # 1. Send summary first
         await update.message.reply_text(summary_to_send, parse_mode='HTML')
-        
-        # 2. Delete progress message only after successful summary
         try: await status_msg.delete()
         except: pass
 
-        # 3. Send individual messages if they fit
         if success_count > 0 and total_msg_length <= 4000:
             combined_msg = "\n".join(all_series_messages) + f"\n{CREDIT_LINE}"
             try: await update.message.reply_text(combined_msg, parse_mode='Markdown')
             except: await update.message.reply_text(combined_msg.replace('*', '').replace('_', ''))
 
-        # 4. Send document
         if success_count > 0:
             file_stream = io.BytesIO(consolidated_content.encode('utf-8'))
             file_stream.name = f"Summary_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt"

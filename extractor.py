@@ -139,7 +139,7 @@ class DriveExtractor:
                 except: pass
         return files, subfolders
 
-    def scan_recursive(self, folder_id: str, depth=0, max_depth=10) -> List[Tuple[str, str]]:
+    def scan_recursive(self, folder_id: str, depth=0, max_depth=10, found_count=0) -> List[Tuple[str, str]]:
         if depth > max_depth: return []
         
         content, err = self.get_html(folder_id)
@@ -151,23 +151,42 @@ class DriveExtractor:
         if title_start != -1 and title_end != -1:
             folder_name = html.unescape(content[title_start+7:title_end].replace(' - Google Drive', ''))
 
-        if self.progress_callback: 
-            self.progress_callback(f"🔍 סורק: {folder_name} (עומק {depth})")
-        
         files, subfolders = self.parse_content(content)
         all_files = files
+        current_total = found_count + len(all_files)
+
+        if self.progress_callback: 
+            self.progress_callback(f"🔍 סורק: {folder_name}\n📂 נמצאו עד כה: {current_total} קבצים")
         
         for sf_id in subfolders: 
             if sf_id != folder_id:
-                all_files.extend(self.scan_recursive(sf_id, depth + 1, max_depth))
+                new_files = self.scan_recursive(sf_id, depth + 1, max_depth, current_total)
+                all_files.extend(new_files)
+                current_total += len(new_files)
         
         return all_files
 
-    def extract_series(self, folder_url: str) -> List[Dict[str, Any]]:
-        self.seen_files = set()
+    def get_series_list(self, folder_url: str) -> List[Any]:
         try:
             folder_id = extract_folder_id(folder_url)
         except ValueError as e: return [{"error": str(e)}]
+
+        content, err = self.get_html(folder_id)
+        if not content: return [{"error": err or "לא ניתן לגשת לתיקייה."}]
+            
+        files, subfolders = self.parse_content(content)
+        
+        # If it looks like a collection of series (many subfolders, few files)
+        if subfolders and len(files) < 5:
+            return subfolders
+        else:
+            return [folder_id]
+
+    def extract_series(self, folder_url_or_id: str) -> List[Dict[str, Any]]:
+        self.seen_files = set()
+        try:
+            folder_id = extract_folder_id(folder_url_or_id)
+        except ValueError as e: folder_id = folder_url_or_id # Might be already an ID
 
         if self.progress_callback: self.progress_callback("📡 מתחבר ל-Google Drive...")
         
@@ -177,15 +196,13 @@ class DriveExtractor:
             
         files, subfolders = self.parse_content(content)
         
+        # We only do multi-processing if it wasn't already split by the bot
+        # This is a safety check. The bot now calls get_series_list first.
         if subfolders and len(files) < 5:
-            if self.progress_callback: self.progress_callback(f"📂 זיהיתי {len(subfolders)} סדרות בתיקייה...")
             all_series_results = []
             for sf_id in subfolders: 
                 res = self.process_single_folder(sf_id)
-                if "error" not in res:
-                    all_series_results.append(res)
-                else:
-                    all_series_results.append({"title": f"שגיאה בתיקייה {sf_id}", "error": res["error"]})
+                all_series_results.append(res)
             return all_series_results
         else:
             return [self.process_single_folder(folder_id)]
