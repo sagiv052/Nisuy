@@ -53,8 +53,7 @@ def get_main_menu():
         "📥 שלחו קישור (או כמה) ונתחיל בעבודה!"
     )
     keyboard = [
-        [InlineKeyboardButton("עזרה ❓", callback_data='help'), InlineKeyboardButton("איך להשתמש? 🛠️", callback_data='usage')],
-        [InlineKeyboardButton("מחיקת הודעות 🗑️", callback_data='clear_chat')]
+        [InlineKeyboardButton("עזרה ❓", callback_data='help'), InlineKeyboardButton("איך להשתמש? 🛠️", callback_data='usage')]
     ]
     return f"{welcome_text}\n\n{CREDIT_LINE}", InlineKeyboardMarkup(keyboard)
 
@@ -77,13 +76,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, reply_markup = get_main_menu()
         await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
     
-    elif query.data == 'clear_chat':
-        # Telegram doesn't allow "clear all", but we can delete the current message and send a fresh start
-        try:
-            await query.message.delete()
-        except: pass
-        text, reply_markup = get_main_menu()
-        await query.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
 
     elif query.data == 'help':
         help_text = (
