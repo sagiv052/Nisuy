@@ -89,10 +89,31 @@ def get_progress_bar(current, total, start_time):
     return f"|{bar}| {percentage:.1f}%{time_info}"
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+    await process_links(update, context, update.message.text)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if document.file_name.lower().endswith(".txt"):
+        status_msg = await update.message.reply_text("⏳ **קורא את הקובץ המצורף...**")
+        try:
+            file = await context.bot.get_file(document.file_id)
+            file_content = await file.download_as_bytearray()
+            text = file_content.decode('utf-8', errors='ignore')
+            await status_msg.delete()
+            await process_links(update, context, text)
+        except Exception as e:
+            logger.error(f"Error handling document: {e}")
+            await status_msg.edit_text("❌ **שגיאה בקריאת הקובץ.**")
+
+async def process_links(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    if not text: return
     user_id = update.message.from_user.id
     links = DRIVE_URL_PATTERN.findall(text)
-    if not links: return
+    if not links:
+        if update.message.document: # If it was a file but no links found
+            await update.message.reply_text("❌ **לא נמצאו קישורי Google Drive בקובץ.**")
+        return
+
     active_tasks[user_id] = True
     status_msg = await update.message.reply_text(f"⏳ **זיהיתי {len(links)} קישורים. מתחיל...**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]]))
     
