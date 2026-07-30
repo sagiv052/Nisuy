@@ -179,47 +179,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.debug(f"Progress update skipped: {e}")
 
         extractor = DriveExtractor(progress_callback=progress)
-        res = await loop.run_in_executor(None, extractor.extract_series, link)
+        results = await loop.run_in_executor(None, extractor.extract_series, link)
         
-        if "error" in res:
-            fail_count += 1
-            series_details.append(f"❌ קישור {i}: שגיאה - {res['error']}")
-            continue
-        
-        success_count += 1
-        title = res['title']
-        data = res['data']
-        stats = res['stats']
-        total_episodes_all += stats['total_episodes']
-        
-        series_details.append(f"✅ {title}: {stats['total_episodes']} פרקים")
-        consolidated_content += f"🎬 סדרה: {title}\n"
-        
-        # Individual message for this series
-        msg_output = f"🎬 **{title}**\n\n"
-        for season, episodes in data.items():
-            msg_output += f"📂 **{season}:**\n"
-            consolidated_content += f"{season}\n"
-            for ep in episodes:
-                ep_num = ep['episode'] if ep['episode'] is not None else "כללי"
-                line = f"• פרק {ep_num}: {ep['url']}"
-                msg_output += f"{line}\n"
-                consolidated_content += f"{line}\n"
-            msg_output += "\n"
-            consolidated_content += "\n"
-        
-        consolidated_content += "-"*20 + "\n\n"
-        msg_output += f"\n{CREDIT_LINE}"
-        
-        # Send individual message
-        try:
-            if len(msg_output) > 4000:
-                for part in [msg_output[k:k+4000] for k in range(0, len(msg_output), 4000)]:
-                    await update.message.reply_text(part, parse_mode='Markdown', disable_web_page_preview=False)
-            else:
-                await update.message.reply_text(msg_output, parse_mode='Markdown', disable_web_page_preview=False)
-        except Exception as e:
-            logger.error(f"Error sending series message: {e}")
+        for res in results:
+            if "error" in res:
+                fail_count += 1
+                series_details.append(f"❌ שגיאה: {res['error']}")
+                continue
+            
+            success_count += 1
+            title = res['title']
+            data = res['data']
+            stats = res['stats']
+            total_episodes_all += stats['total_episodes']
+            
+            series_details.append(f"✅ {title}: {stats['total_episodes']} פרקים")
+            consolidated_content += f"🎬 סדרה: {title}\n"
+            
+            # Individual message for this series
+            msg_output = f"🎬 **{title}**\n\n"
+            for season, episodes in data.items():
+                msg_output += f"📂 **{season}:**\n"
+                consolidated_content += f"{season}\n"
+                for ep in episodes:
+                    ep_num = ep['episode'] if ep['episode'] is not None else "כללי"
+                    line = f"• פרק {ep_num}: {ep['url']}"
+                    msg_output += f"{line}\n"
+                    consolidated_content += f"{line}\n"
+                msg_output += "\n"
+                consolidated_content += "\n"
+            
+            consolidated_content += "-"*20 + "\n\n"
+            msg_output += f"\n{CREDIT_LINE}"
+            
+            # Send individual message
+            try:
+                if len(msg_output) > 4000:
+                    for part in [msg_output[k:k+4000] for k in range(0, len(msg_output), 4000)]:
+                        await update.message.reply_text(part, parse_mode='Markdown', disable_web_page_preview=False)
+                else:
+                    await update.message.reply_text(msg_output, parse_mode='Markdown', disable_web_page_preview=False)
+            except Exception as e:
+                logger.error(f"Error sending series message: {e}")
 
     # Final summary
     summary_text = "🎊 **העבודה הסתיימה בהצלחה!** 🏁\n\n"

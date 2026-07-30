@@ -101,6 +101,8 @@ class DriveExtractor:
     def get_html(self, folder_id: str) -> Tuple[Optional[str], Optional[str]]:
         url = f'https://drive.google.com/embeddedfolderview?id={folder_id}#grid'
         try:
+            # Add a tiny random jitter to avoid being flagged by Google
+            time.sleep(random.uniform(0.1, 0.3))
             response = self.session.get(url, timeout=20)
             if response.status_code == 404:
                 return None, "התיקייה לא נמצאה. ייתכן שהקישור שבור."
@@ -158,30 +160,51 @@ class DriveExtractor:
         # Limit total subfolders to prevent infinite loops or extreme memory usage
         for sf_id in subfolders[:50]: 
             if sf_id != folder_id:
+                if self.progress_callback: self.progress_callback(f"📂 נכנס לתיקיית משנה...")
                 all_files.extend(self.scan_recursive(sf_id, depth + 1, max_depth))
         
         return all_files
 
-    def extract_series(self, folder_url: str) -> Dict[str, Any]:
+    def extract_series(self, folder_url: str) -> List[Dict[str, Any]]:
         self.seen_files = set()
         try:
             folder_id = extract_folder_id(folder_url)
-        except ValueError as e: return {"error": str(e)}
+        except ValueError as e: return [{"error": str(e)}]
 
         if self.progress_callback: self.progress_callback("📡 מתחבר ל-Google Drive...")
         
-        # Get initial title
+        # Get initial content
         content, err = self.get_html(folder_id)
         if not content:
-            return {"error": err or "לא ניתן לגשת לתיקייה. וודא שהיא ציבורית."}
+            return [{"error": err or "לא ניתן לגשת לתיקייה. וודא שהיא ציבורית."}]
             
-        folder_title = "סדרה ללא שם"
-        soup = BeautifulSoup(content, 'html.parser')
-        title_tag = soup.find('title')
-        if title_tag: 
-            folder_title = clean_series_name(title_tag.get_text().replace(' - Google Drive', ''))
+        files, subfolders = self.parse_content(content)
+        
+        # LOGIC: If there are subfolders and very few/no files in the root, 
+        # treat each subfolder as a separate series.
+        if subfolders and len(files) < 5:
+            if self.progress_callback: self.progress_callback(f"📂 זיהיתי {len(subfolders)} סדרות בתיקייה. מתחיל בחילוץ פרטני...")
+            all_series_results = []
+            for sf_id in subfolders[:30]: # Limit to 30 series per parent folder
+                res = self.process_single_folder(sf_id)
+                if "error" not in res:
+                    all_series_results.append(res)
+            return all_series_results
+        else:
+            # Treat the whole folder as one series
+            return [self.process_single_folder(folder_id)]
 
-        # Recursive scan
+    def process_single_folder(self, folder_id: str) -> Dict[str, Any]:
+        # Helper to process a folder as a single series
+        content, err = self.get_html(folder_id)
+        if not content: return {"error": err or "שגיאה בגישה לתיקייה"}
+        
+        folder_title = "סדרה ללא שם"
+        title_start = content.find('<title>')
+        title_end = content.find('</title>')
+        if title_start != -1 and title_end != -1:
+            folder_title = clean_series_name(content[title_start+7:title_end].replace(' - Google Drive', ''))
+
         all_entries = self.scan_recursive(folder_id)
         if not all_entries: 
             return {"error": "לא נמצאו קבצים בתיקייה. וודא שיש בה קבצי וידאו והיא פתוחה לצפייה."}
