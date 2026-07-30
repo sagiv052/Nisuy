@@ -62,7 +62,7 @@ def detect_quality(name: str) -> str:
 def clean_series_name(title: str) -> str:
     if not title: return ''
     title = html.unescape(title)
-    title = EMOJI_PATTERN.sub('', title)
+    # EMOJI_PATTERN.sub('', title)  # Disabled to keep emojis
     title = re.sub(r'\.(?:mp4|mkv|avi|pdf|zip|rar|txt|jpg|jpeg|png|gif|webm|mov|srt)\b', '', title, flags=re.IGNORECASE)
     for jp in JUNK_PATTERNS: title = jp.sub('', title)
     title = re.sub(r'[_*+\-=|~#]', ' ', title)
@@ -100,14 +100,22 @@ class DriveExtractor:
         self.progress_callback = progress_callback
         self.seen_files = set()
         self.seen_folders = set()
-        self.session = requests.Session()
-        self.session.mount('https://', requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20))
+        # Create a pool of sessions, one for each User Agent
+        self.sessions = []
+        for ua in USER_AGENTS:
+            s = requests.Session()
+            s.headers.update({'User-Agent': ua})
+            s.mount('https://', requests.adapters.HTTPAdapter(pool_connections=5, pool_maxsize=5))
+            self.sessions.append(s)
+        self.num_sessions = len(self.sessions)
 
-    def get_html(self, item_id: str, is_folder: bool = True) -> Tuple[Optional[str], Optional[str]]:
+    def get_html(self, item_id: str, is_folder: bool = True, session_idx: int = 0) -> Tuple[Optional[str], Optional[str]]:
         url = f'https://drive.google.com/embeddedfolderview?id={item_id}#grid' if is_folder else f'https://drive.google.com/file/d/{item_id}/view'
         try:
+            # Use the assigned session
+            session = self.sessions[session_idx % self.num_sessions]
             time.sleep(random.uniform(0.05, 0.15))
-            r = self.session.get(url, headers={'User-Agent': random.choice(USER_AGENTS)}, timeout=15)
+            r = session.get(url, timeout=15)
             r.raise_for_status()
             return r.text, None
         except Exception as e: return None, str(e)
@@ -143,12 +151,20 @@ class DriveExtractor:
         all_files = []
         queue = [(folder_id, 0)]
         self.seen_folders.add(folder_id)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        
+        # Use as many workers as we have sessions/User Agents
+        max_workers = self.num_sessions
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             while queue:
                 batch = queue
                 queue = []
-                futures = {executor.submit(self.get_html, fid, True): depth for fid, depth in batch if depth <= max_depth}
+                # Distribute tasks among sessions using session_idx
+                futures = {
+                    executor.submit(self.get_html, fid, True, i): (fid, depth) 
+                    for i, (fid, depth) in enumerate(batch) if depth <= max_depth
+                }
                 for f in concurrent.futures.as_completed(futures):
+                    fid, depth = futures[f]
                     c, _ = f.result()
                     if not c: continue
                     fs, sfs = self.parse_content(c)
@@ -157,7 +173,7 @@ class DriveExtractor:
                     for sf in sfs:
                         if sf not in self.seen_folders:
                             self.seen_folders.add(sf)
-                            queue.append((sf, futures[f] + 1))
+                            queue.append((sf, depth + 1))
         return all_files
 
     def get_series_list(self, url: str) -> List[Any]:
@@ -181,15 +197,16 @@ class DriveExtractor:
             fs, sfs = self.parse_content(c, False)
             if sfs and len(fs) < 3:
                 results = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-                    futures = [ex.submit(self.process_item, sf, True) for sf in sfs]
+                # Use sessions for processing sub-items as well
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, self.num_sessions)) as ex:
+                    futures = [ex.submit(self.process_item, sf, True, None, i) for i, sf in enumerate(sfs)]
                     for f in concurrent.futures.as_completed(futures): results.append(f.result())
                 return results
             return [self.process_item(fid, True, c)]
         except: return [{"error": "קישור לא תקין", "title": "שגיאה"}]
 
-    def process_item(self, fid: str, is_folder: bool, content=None) -> Dict[str, Any]:
-        c = content or self.get_html(fid, is_folder)[0]
+    def process_item(self, fid: str, is_folder: bool, content=None, session_idx=0) -> Dict[str, Any]:
+        c = content or self.get_html(fid, is_folder, session_idx)[0]
         if not c: return {"error": "שגיאה", "title": "לא ידוע"}
         t = clean_series_name(re.search(r'<title>(.*?)</title>', c).group(1).replace(' - Google Drive','') if re.search(r'<title>(.*?)</title>', c) else "סדרה")
         entries = [(t, f"https://drive.google.com/file/d/{fid}/view")] if not is_folder else self.scan_recursive(fid)
