@@ -164,7 +164,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         last_update_time = [0] # Use list for closure modification
         def progress(msg, current=None, total=None):
-            # Throttle updates to Telegram (max 1 update per 2 seconds) to avoid Rate Limits
             current_time = time.time()
             if current_time - last_update_time[0] < 2.0 and current is not None:
                 return
@@ -215,29 +214,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 consolidated_content += "\n"
             
             consolidated_content += "-"*20 + "\n\n"
-            
-            # Store message for potential combined sending
             all_series_messages.append(msg_output)
-            total_msg_length += len(msg_output) + len(CREDIT_LINE) + 5 # Add margin for separators
+            total_msg_length += len(msg_output) + len(CREDIT_LINE) + 10
 
-    # Final summary
-    summary_text = "🎊 **העבודה הסתיימה בהצלחה!** 🏁\n\n"
-    summary_text += f"✅ סדרות שחולצו: {success_count}\n"
-    summary_text += f"❌ סדרות שנכשלו: {fail_count}\n"
-    summary_text += f"📦 סה\"כ פרקים: {total_episodes_all}\n\n"
-    summary_text += "📝 **פירוט:**\n" + "\n".join(series_details) + "\n\n"
+    # Final summary logic
+    base_summary = "🎊 **העבודה הסתיימה בהצלחה!** 🏁\n\n"
+    base_summary += f"✅ סדרות שחולצו: {success_count}\n"
+    base_summary += f"❌ סדרות שנכשלו: {fail_count}\n"
+    base_summary += f"📦 סה\"כ פרקים: {total_episodes_all}\n\n"
     
-    if total_msg_length > 4000:
-        summary_text += "⚠️ **רשימת הקישורים ארוכה מדי להודעה, היא מצורפת בקובץ הטקסט למטה.** 📄\n\n"
+    details_list_text = "📝 **פירוט:**\n" + "\n".join(series_details) + "\n\n"
+    full_summary = base_summary + details_list_text + CREDIT_LINE
     
-    summary_text += CREDIT_LINE
-    
+    # If summary report is too long, put it in the file instead of message
+    if len(full_summary) > 4000:
+        summary_to_send = base_summary + "⚠️ **פירוט הסדרות ארוך מדי להודעה, הוא נמצא בתוך הקובץ המצורף.** 📄\n\n" + CREDIT_LINE
+        # Prepend the report to the file content
+        consolidated_content = "=== דוח סיכום ===\n" + "\n".join(series_details) + "\n\n" + "="*30 + "\n\n" + consolidated_content
+    else:
+        summary_to_send = full_summary
+
     # Send final summary
     try:
         await status_msg.delete()
     except: pass
     
-    await update.message.reply_text(summary_text, parse_mode='Markdown')
+    await update.message.reply_text(summary_to_send, parse_mode='Markdown')
     
     # Send series links as message if they fit
     if success_count > 0 and total_msg_length <= 4000:
@@ -247,28 +249,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error sending combined series message: {e}")
             await update.message.reply_text(combined_msg.replace('*', '').replace('_', ''), disable_web_page_preview=False)
+    elif success_count > 0:
+        # User explicitly asked to send as file if too long
+        pass # The file is sent below anyway
 
     # Send consolidated file
     if success_count > 0:
         file_stream = io.BytesIO(consolidated_content.encode('utf-8'))
         file_stream.name = f"Summary_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+        
+        caption = f"📄 **קובץ הקישורים והדוח המלא** ✨\n"
+        if total_msg_length > 4000 or len(full_summary) > 4000:
+            caption += "⚠️ מכיל את כל הקישורים והפירוט (היה ארוך מדי להודעה)\n"
+        caption += f"\n{CREDIT_LINE}"
+        
         await update.message.reply_document(
             document=file_stream, 
-            caption=f"📄 **קובץ הקישורים המאוחד** ✨\n\n{CREDIT_LINE}", 
+            caption=caption, 
             parse_mode='Markdown'
         )
     
-    # Send main menu again for convenience
+    # Send main menu again
     text, reply_markup = get_main_menu()
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
     
     active_tasks.pop(user_id, None)
 
 def main():
-    # Start Flask server
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    # Start Keep-Alive thread
     threading.Thread(target=keep_alive, daemon=True).start()
     
     application = Application.builder().token(TOKEN).build()
