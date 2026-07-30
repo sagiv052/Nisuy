@@ -88,6 +88,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, reply_markup = get_main_menu()
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    if document.file_name.lower().endswith('.txt'):
+        try:
+            file = await context.bot.get_file(document.file_id)
+            content = await file.download_as_bytearray()
+            text_content = content.decode('utf-8')
+            
+            if len(text_content) > 4000:
+                for part in [text_content[k:k+4000] for k in range(0, len(text_content), 4000)]:
+                    await update.message.reply_text(part)
+            else:
+                await update.message.reply_text(text_content)
+        except Exception as e:
+            logger.error(f"Error handling document: {e}")
+            await update.message.reply_text("❌ מצטער, לא הצלחתי לקרוא את תוכן הקובץ.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.message.from_user.id
@@ -207,6 +224,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"📄 **דוח סיכום מאוחד**\nמכיל את כל הקישורים והפרקים שחולצו. ✨\n\n{CREDIT_LINE}", 
             parse_mode='Markdown'
         )
+
+        # שליחת תוכן הקובץ גם כהודעת טקסט
+        try:
+            if len(final_file_content) > 4000:
+                for part in [final_file_content[k:k+4000] for k in range(0, len(final_file_content), 4000)]:
+                    await update.message.reply_text(part)
+            else:
+                await update.message.reply_text(final_file_content)
+        except Exception as e:
+            logger.error(f"Error sending consolidated text message: {e}")
     
     active_tasks.pop(user_id, None)
 
@@ -216,6 +243,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_document))
     application.run_polling()
 
 if __name__ == '__main__':
