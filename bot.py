@@ -22,8 +22,8 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # Bot Logic
-TOKEN = "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU"
-CREDIT_LINE = "❤️ **הוכן והועלה על ידי אלון נושם באהבה**"
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU")
+CREDIT_LINE = "❤️ *הוכן והועלה על ידי אלון נושם באהבה*"
 
 # State for cancellation
 active_tasks = {}
