@@ -69,7 +69,7 @@ def extract_folder_id(input_str: str) -> str:
         match = re.search(pattern, input_str)
         if match: return match.group(1)
     if re.match(r'^[a-zA-Z0-9_-]+$', input_str): return input_str
-    raise ValueError(f"קישור לא תקין")
+    raise ValueError(f"קישור לא תקין. וודא שהעתקת את הקישור המלא מהדפדפן.")
 
 def parse_season_episode(name: str) -> Tuple[Optional[int], Optional[int]]:
     name = name.replace('_', ' ').strip()
@@ -102,10 +102,16 @@ class DriveExtractor:
         url = f'https://drive.google.com/embeddedfolderview?id={folder_id}#grid'
         try:
             response = self.session.get(url, timeout=20)
+            if response.status_code == 404:
+                return None, "התיקייה לא נמצאה. ייתכן שהקישור שבור."
+            if response.status_code == 403:
+                return None, "אין גישה לתיקייה. וודא שהיא מוגדרת כציבורית ('כל מי שקיבל את הקישור')."
             response.raise_for_status()
             return response.text, None
+        except requests.exceptions.Timeout:
+            return None, "החיבור לשרת Google Drive התעכב יותר מדי. נסה שוב בעוד רגע."
         except Exception as e:
-            return None, str(e)
+            return None, f"שגיאת תקשורת: {str(e)}"
 
     def parse_content(self, content: str) -> Tuple[List[Tuple[str, str]], List[str]]:
         files = []
@@ -132,10 +138,18 @@ class DriveExtractor:
 
     def scan_recursive(self, folder_id: str, depth=0, max_depth=3) -> List[Tuple[str, str]]:
         if depth > max_depth: return []
-        if self.progress_callback: self.progress_callback(f"🔍 סורק תיקייה... (עומק {depth})")
         
         content, err = self.get_html(folder_id)
         if not content: return []
+        
+        soup = BeautifulSoup(content, 'html.parser')
+        folder_name = "תיקייה"
+        title_tag = soup.find('title')
+        if title_tag:
+            folder_name = title_tag.get_text().replace(' - Google Drive', '')
+
+        if self.progress_callback: 
+            self.progress_callback(f"🔍 סורק: {folder_name} (עומק {depth})")
         
         files, subfolders = self.parse_content(content)
         all_files = files
@@ -157,7 +171,7 @@ class DriveExtractor:
         # Get initial title
         content, err = self.get_html(folder_id)
         if not content:
-            return {"error": f"לא ניתן לגשת לתיקייה. וודא שהיא ציבורית. ({err})"}
+            return {"error": err or "לא ניתן לגשת לתיקייה. וודא שהיא ציבורית."}
             
         folder_title = "סדרה ללא שם"
         soup = BeautifulSoup(content, 'html.parser')
@@ -170,11 +184,14 @@ class DriveExtractor:
         if not all_entries: 
             return {"error": "לא נמצאו קבצים בתיקייה. וודא שיש בה קבצי וידאו והיא פתוחה לצפייה."}
 
-        if self.progress_callback: self.progress_callback(f"⚙️ מעבד {len(all_entries)} קבצים שנמצאו...")
-
         grouped = {}
         total_episodes = 0
-        for raw_name, url in all_entries:
+        total_count = len(all_entries)
+        
+        for idx, (raw_name, url) in enumerate(all_entries, 1):
+            if self.progress_callback and idx % 5 == 0:
+                self.progress_callback(f"⚙️ מעבד קובץ {idx} מתוך {total_count}...", current=idx, total=total_count)
+                
             quality = detect_quality(raw_name)
             name = clean_series_name(raw_name)
             season, episode = parse_season_episode(raw_name)
