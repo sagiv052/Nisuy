@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import threading
+import io
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -22,92 +23,105 @@ def run_flask():
 
 # Bot Logic
 TOKEN = "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU"
+CREDIT_LINE = "❤️ **הוכן והועלה על ידי אלון נושם באהבה**"
+
+# State for cancellation
+active_tasks = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
-        "👋 **שלום! אני בוט יוצר לינקים לסדרות.**\n\n"
-        "שלח לי קישור לתיקיית Google Drive (ציבורית) ואני אחלץ עבורך את כל הפרקים מסודרים לפי עונות.\n\n"
-        "🔧 **איך זה עובד?**\n"
-        "1. וודא שהתיקייה בדרייב מוגדרת כציבורית.\n"
-        "2. שלח את הקישור כאן.\n"
-        "3. קבל רשימה מעוצבת של כל הפרקים!"
+        "👋 **ברוכים הבאים לבוט הקישורים המשודרג!**\n\n"
+        "עכשיו עם תמיכה בתיקיות משנה, זיהוי איכות, וניקוי שמות חכם.\n\n"
+        "שלחו קישור (או כמה) ונתחיל!"
     )
-    keyboard = [[InlineKeyboardButton("עזרה ❓", callback_data='help')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    keyboard = [[InlineKeyboardButton("עזרה ❓", callback_data='help')], [InlineKeyboardButton("איך להשתמש? 🛠️", callback_data='usage')]]
+    await update.message.reply_text(f"{welcome_text}\n\n{CREDIT_LINE}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    if query.data == 'cancel_all':
+        active_tasks[user_id] = False
+        await query.edit_message_text("🛑 **הפעולה בוטלה על ידי המשתמש.**")
+    elif query.data == 'help':
+        help_text = "📖 **מה חדש?**\n• סריקה עמוקה של תיקיות.\n• זיהוי איכות (4K, 1080p).\n• ניקוי שמות אוטומטי.\n• שליחת מספר קישורים במכה."
+        await query.edit_message_text(f"{help_text}\n\n{CREDIT_LINE}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("חזרה 🏠", callback_data='back')]]), parse_mode='Markdown')
+    elif query.data == 'back':
+        await start(update, context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    user_id = update.message.from_user.id
     links = DRIVE_URL_PATTERN.findall(text)
     
-    if not links:
-        await update.message.reply_text("❌ לא מצאתי קישור תקין של Google Drive. אנא שלח קישור מלא.")
-        return
+    if not links: return
 
-    status_msg = await update.message.reply_text("⏳ **מתחיל בחילוץ...**\nמתחבר ל-Google Drive ומנתח את התוכן.")
+    active_tasks[user_id] = True
+    total = len(links)
+    status_msg = await update.message.reply_text(f"⏳ **זיהיתי {total} קישורים. מתחיל בעבודה...**", 
+                                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]]))
     
-    extractor = DriveExtractor(use_browser=True)
-    results = []
-    
-    for link in links:
-        # Run extraction in a thread to not block the bot
+    success_count = 0
+    for i, link in enumerate(links, 1):
+        if not active_tasks.get(user_id, True): break
+        
+        await status_msg.edit_text(f"🔄 **מעבד {i}/{total}...**\nסורק תיקיות וקבצים (זה עשוי לקחת זמן)", 
+                                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]]))
+        
+        def progress(msg):
+            # Silent progress updates
+            try: asyncio.run_coroutine_threadsafe(status_msg.edit_text(f"🔄 **מעבד {i}/{total}...**\n{msg}"), asyncio.get_event_loop())
+            except: pass
+
+        extractor = DriveExtractor(progress_callback=progress)
         loop = asyncio.get_event_loop()
         res = await loop.run_in_executor(None, extractor.extract_series, link)
-        results.append(res)
-
-    await status_msg.delete()
-
-    for res in results:
+        
         if "error" in res:
-            await update.message.reply_text(f"❌ **שגיאה בחילוץ:**\n{res['error']}")
+            await update.message.reply_text(f"❌ **שגיאה בקישור {i}:** {res['error']}")
             continue
         
-        title = res.get('title', 'סדרה ללא שם')
-        output = f"🎬 **{title}**\n\n"
+        success_count += 1
+        title = res['title']
+        data = res['data']
+        stats = res['stats']
         
-        data = res.get('data', {})
+        msg_output = f"🎬 **{title}**\n\n"
+        file_content = f"--- {title} ---\nסה\"כ: {stats['total_episodes']} פרקים\n\n"
+        
         for season, episodes in data.items():
-            output += f"📂 **{season}:**\n"
+            msg_output += f"📂 **{season}:**\n"
+            file_content += f"[{season}]\n"
             for ep in episodes:
-                ep_name = ep['name']
-                ep_url = ep['url']
-                output += f"• [{ep_name}]({ep_url})\n"
-            output += "\n"
+                msg_output += f"• [{ep['name']}]({ep['url']})\n"
+                file_content += f"{ep['name']}: {ep['url']}\n"
+            msg_output += "\n"
+            file_content += "\n"
         
-        # Split long messages if necessary
-        if len(output) > 4000:
-            parts = [output[i:i+4000] for i in range(0, len(output), 4000)]
-            for part in parts:
+        msg_output += f"\n{CREDIT_LINE}"
+        
+        if len(msg_output) > 4000:
+            for part in [msg_output[i:i+4000] for i in range(0, len(msg_output), 4000)]:
                 await update.message.reply_text(part, parse_mode='Markdown', disable_web_page_preview=True)
         else:
-            await update.message.reply_text(output, parse_mode='Markdown', disable_web_page_preview=True)
+            await update.message.reply_text(msg_output, parse_mode='Markdown', disable_web_page_preview=True)
+        
+        file_stream = io.BytesIO(file_content.encode('utf-8'))
+        file_stream.name = f"{title.replace(' ', '_')}.txt"
+        await update.message.reply_document(document=file_stream, caption=f"📄 {title}\n{CREDIT_LINE}", parse_mode='Markdown')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "ℹ️ **עזרה:**\n"
-        "- התיקייה חייבת להיות ציבורית (Anyone with the link can view).\n"
-        "- אם התיקייה מכילה תיקיות משנה (עונות), מומלץ לשלוח קישור ישיר לתיקיית העונה.\n"
-        "- הבוט מזהה אוטומטית מספרי פרקים ועונות משם הקובץ."
-    )
-    if update.callback_query:
-        await update.callback_query.message.reply_text(help_text, parse_mode='Markdown')
-        await update.callback_query.answer()
-    else:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+    final_text = f"🏁 **העבודה הסתיימה!**\n✅ הצלחנו לחלץ {success_count} סדרות.\n\n{CREDIT_LINE}"
+    await status_msg.edit_text(final_text, parse_mode='Markdown')
+    active_tasks.pop(user_id, None)
 
 def main():
-    # Start Flask in background
     threading.Thread(target=run_flask, daemon=True).start()
-    
-    # Start Bot
     application = Application.builder().token(TOKEN).build()
-    
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(help_command, pattern='help'))
+    application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    logger.info("Bot started...")
     application.run_polling()
 
 if __name__ == '__main__':
