@@ -3,6 +3,7 @@ import logging
 import asyncio
 import threading
 import io
+import datetime
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -25,17 +26,25 @@ def run_flask():
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU")
 CREDIT_LINE = "❤️ *הוכן והועלה על ידי אלון נושם באהבה*"
 
-# State for cancellation
-active_tasks = {}
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Main Menu UI
+def get_main_menu():
     welcome_text = (
         "👋 **ברוכים הבאים לבוט הקישורים המשודרג!**\n\n"
         "עכשיו עם תמיכה בתיקיות משנה, זיהוי איכות, וניקוי שמות חכם.\n\n"
         "שלחו קישור (או כמה) ונתחיל!"
     )
-    keyboard = [[InlineKeyboardButton("עזרה ❓", callback_data='help')], [InlineKeyboardButton("איך להשתמש? 🛠️", callback_data='usage')]]
-    await update.message.reply_text(f"{welcome_text}\n\n{CREDIT_LINE}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    keyboard = [
+        [InlineKeyboardButton("עזרה ❓", callback_data='help')],
+        [InlineKeyboardButton("איך להשתמש? 🛠️", callback_data='usage')]
+    ]
+    return f"{welcome_text}\n\n{CREDIT_LINE}", InlineKeyboardMarkup(keyboard)
+
+# State for cancellation
+active_tasks = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, reply_markup = get_main_menu()
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -45,11 +54,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == 'cancel_all':
         active_tasks[user_id] = False
         await query.edit_message_text("🛑 **הפעולה בוטלה על ידי המשתמש.**")
+    
     elif query.data == 'help':
-        help_text = "📖 **מה חדש?**\n• סריקה עמוקה של תיקיות.\n• זיהוי איכות (4K, 1080p).\n• ניקוי שמות אוטומטי.\n• שליחת מספר קישורים במכה."
-        await query.edit_message_text(f"{help_text}\n\n{CREDIT_LINE}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("חזרה 🏠", callback_data='back')]]), parse_mode='Markdown')
+        help_text = (
+            "📖 **מה חדש?**\n"
+            "• סריקה עמוקה של תיקיות.\n"
+            "• זיהוי איכות (4K, 1080p).\n"
+            "• ניקוי שמות אוטומטי.\n"
+            "• שליחת מספר קישורים במכה.\n"
+            "• דוח סיכום מאוחד לכל הקישורים."
+        )
+        await query.edit_message_text(
+            f"{help_text}\n\n{CREDIT_LINE}", 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("חזרה 🏠", callback_data='back')]]), 
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == 'usage':
+        usage_text = (
+            "🛠️ **איך להשתמש בבוט?**\n\n"
+            "1. העתיקו קישור לתיקיית Google Drive ציבורית.\n"
+            "2. ניתן לשלוח מספר קישורים בהודעה אחת.\n"
+            "3. הבוט יסרוק את כל הקבצים ותיקיות המשנה.\n"
+            "4. בסיום תקבלו הודעה לכל סדרה וקובץ סיכום אחד לכולן."
+        )
+        await query.edit_message_text(
+            f"{usage_text}\n\n{CREDIT_LINE}", 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("חזרה 🏠", callback_data='back')]]), 
+            parse_mode='Markdown'
+        )
+        
     elif query.data == 'back':
-        await start(update, context)
+        text, reply_markup = get_main_menu()
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -59,20 +96,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not links: return
 
     active_tasks[user_id] = True
-    total = len(links)
-    status_msg = await update.message.reply_text(f"⏳ **זיהיתי {total} קישורים. מתחיל בעבודה...**", 
+    total_links = len(links)
+    status_msg = await update.message.reply_text(f"⏳ **זיהיתי {total_links} קישורים. מתחיל בעבודה...**", 
                                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]]))
     
     success_count = 0
+    fail_count = 0
+    total_episodes_all = 0
+    
+    consolidated_content = f"📊 דוח סיכום חילוץ - {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+    consolidated_content += "="*40 + "\n\n"
+    
+    series_details = []
+
     for i, link in enumerate(links, 1):
         if not active_tasks.get(user_id, True): break
         
-        await status_msg.edit_text(f"🔄 **מעבד {i}/{total}...**\nסורק תיקיות וקבצים (זה עשוי לקחת זמן)", 
+        await status_msg.edit_text(f"🔄 **מעבד סדרה {i}/{total_links}...**\nסורק תיקיות וקבצים...", 
                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]]))
         
         def progress(msg):
-            # Silent progress updates
-            try: asyncio.run_coroutine_threadsafe(status_msg.edit_text(f"🔄 **מעבד {i}/{total}...**\n{msg}"), asyncio.get_event_loop())
+            try: asyncio.run_coroutine_threadsafe(status_msg.edit_text(f"🔄 **מעבד {i}/{total_links}...**\n{msg}"), asyncio.get_event_loop())
             except: pass
 
         extractor = DriveExtractor(progress_callback=progress)
@@ -80,40 +124,79 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await loop.run_in_executor(None, extractor.extract_series, link)
         
         if "error" in res:
-            await update.message.reply_text(f"❌ **שגיאה בקישור {i}:** {res['error']}")
+            fail_count += 1
+            series_details.append(f"❌ קישור {i}: שגיאה - {res['error']}")
+            consolidated_content += f"❌ סדרה {i} (נכשל):\nקישור: {link}\nשגיאה: {res['error']}\n\n"
+            consolidated_content += "-"*20 + "\n\n"
             continue
         
         success_count += 1
         title = res['title']
         data = res['data']
         stats = res['stats']
+        total_episodes_all += stats['total_episodes']
         
+        series_details.append(f"✅ {title}: {stats['total_episodes']} פרקים")
+        
+        # Add to consolidated file
+        consolidated_content += f"🎬 סדרה: {title}\n"
+        consolidated_content += f"🔗 קישור מקור: {link}\n"
+        consolidated_content += f"📦 סה\"כ פרקים: {stats['total_episodes']}\n\n"
+        
+        # Individual message for this series
         msg_output = f"🎬 **{title}**\n\n"
-        file_content = f"--- {title} ---\nסה\"כ: {stats['total_episodes']} פרקים\n\n"
-        
         for season, episodes in data.items():
             msg_output += f"📂 **{season}:**\n"
-            file_content += f"[{season}]\n"
+            consolidated_content += f"[{season}]\n"
             for ep in episodes:
-                msg_output += f"• [{ep['name']}]({ep['url']})\n"
-                file_content += f"{ep['name']}: {ep['url']}\n"
+                ep_num = ep['episode'] if ep['episode'] is not None else "כללי"
+                line = f"פרק {ep_num}: {ep['url']}"
+                msg_output += f"{line}\n"
+                consolidated_content += f"{line}\n"
             msg_output += "\n"
-            file_content += "\n"
+            consolidated_content += "\n"
+        
+        consolidated_content += "-"*20 + "\n\n"
         
         msg_output += f"\n{CREDIT_LINE}"
         
+        # Send individual message
         if len(msg_output) > 4000:
             for part in [msg_output[i:i+4000] for i in range(0, len(msg_output), 4000)]:
-                await update.message.reply_text(part, parse_mode='Markdown', disable_web_page_preview=True)
+                await update.message.reply_text(part, parse_mode='Markdown', disable_web_page_preview=False)
         else:
-            await update.message.reply_text(msg_output, parse_mode='Markdown', disable_web_page_preview=True)
-        
-        file_stream = io.BytesIO(file_content.encode('utf-8'))
-        file_stream.name = f"{title.replace(' ', '_')}.txt"
-        await update.message.reply_document(document=file_stream, caption=f"📄 {title}\n{CREDIT_LINE}", parse_mode='Markdown')
+            await update.message.reply_text(msg_output, parse_mode='Markdown', disable_web_page_preview=False)
 
-    final_text = f"🏁 **העבודה הסתיימה!**\n✅ הצלחנו לחלץ {success_count} סדרות.\n\n{CREDIT_LINE}"
-    await status_msg.edit_text(final_text, parse_mode='Markdown')
+    # Prepare final summary
+    summary_text = "🏁 **העבודה הסתיימה!**\n\n"
+    summary_text += f"✅ סדרות שחולצו: {success_count}\n"
+    if fail_count > 0:
+        summary_text += f"❌ קישורים שנכשלו: {fail_count}\n"
+    summary_text += f"📦 סה\"כ פרקים בכל הסדרות: {total_episodes_all}\n\n"
+    
+    summary_text += "**פירוט:**\n" + "\n".join(series_details) + "\n\n"
+    summary_text += CREDIT_LINE
+    
+    # Update status message to final summary
+    await status_msg.edit_text(summary_text, parse_mode='Markdown')
+    
+    # Send consolidated file
+    summary_header = f"--- סיכום כללי ---\n"
+    summary_header += f"סדרות בהצלחה: {success_count}\n"
+    summary_header += f"סדרות שנכשלו: {fail_count}\n"
+    summary_header += f"סה\"כ פרקים: {total_episodes_all}\n"
+    summary_header += "="*40 + "\n\n"
+    
+    final_file_content = summary_header + consolidated_content
+    file_stream = io.BytesIO(final_file_content.encode('utf-8'))
+    file_stream.name = f"Summary_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    
+    await update.message.reply_document(
+        document=file_stream, 
+        caption=f"📄 **דוח סיכום מאוחד**\nמכיל את כל הקישורים והפרקים שחולצו.\n\n{CREDIT_LINE}", 
+        parse_mode='Markdown'
+    )
+    
     active_tasks.pop(user_id, None)
 
 def main():

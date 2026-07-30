@@ -23,7 +23,10 @@ JUNK_PATTERNS = [
     re.compile(r'(?i)קרדיט\s+ל.*'),
     re.compile(r'(?i)מבית\s+.*'),
     re.compile(r'(?i)סרטים\s+וסדרות\s+בדרייב'),
-    re.compile(r'(?i)driveflix|qbzn|h264|h265|x264|x265'),
+    re.compile(r'(?i)driveflix|qbzn|h264|h265|x264|x265|web-dl|brrip|bluray'),
+    re.compile(r'(?i)גוזלן|לולו\s+סרטים|ת\.מ|ע"י\s+.*|לצפייה\s+ישירה|תרגום\s+מובנה|מדובב|סדרות'),
+    re.compile(r'(?i)עונה\s*\d+\s*פרק\s*\d+'),
+    re.compile(r'(?i)ע\d+פ\d+'),
 ]
 
 def detect_quality(name: str) -> str:
@@ -44,6 +47,11 @@ def clean_series_name(title: str) -> str:
     
     # Clean up specific series patterns
     title = re.sub(r'(?i)\b(?:4k|2160p|1080p|720p|480p|fhd|hd|sd)\b', '', title)
+    
+    # Remove Season/Episode mentions from the main title to keep it clean
+    title = re.sub(r'(?i)(?:עונה|ע|Season|S)\s*\d+', '', title)
+    title = re.sub(r'(?i)(?:פרק|פ|Episode|E)\s*\d+', '', title)
+    title = re.sub(r'(?i)ע\d+פ\d+', '', title)
     
     title = re.sub(r'\s+', ' ', title)
     return title.strip(' -/\\').strip()
