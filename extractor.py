@@ -136,17 +136,18 @@ class DriveExtractor:
                 except: pass
         return files, subfolders
 
-    def scan_recursive(self, folder_id: str, depth=0, max_depth=3) -> List[Tuple[str, str]]:
+    def scan_recursive(self, folder_id: str, depth=0, max_depth=5) -> List[Tuple[str, str]]:
         if depth > max_depth: return []
         
         content, err = self.get_html(folder_id)
         if not content: return []
         
-        soup = BeautifulSoup(content, 'html.parser')
+        # Use a more memory-efficient way to find folder name
         folder_name = "תיקייה"
-        title_tag = soup.find('title')
-        if title_tag:
-            folder_name = title_tag.get_text().replace(' - Google Drive', '')
+        title_start = content.find('<title>')
+        title_end = content.find('</title>')
+        if title_start != -1 and title_end != -1:
+            folder_name = content[title_start+7:title_end].replace(' - Google Drive', '')
 
         if self.progress_callback: 
             self.progress_callback(f"🔍 סורק: {folder_name} (עומק {depth})")
@@ -154,7 +155,8 @@ class DriveExtractor:
         files, subfolders = self.parse_content(content)
         all_files = files
         
-        for sf_id in subfolders:
+        # Limit total subfolders to prevent infinite loops or extreme memory usage
+        for sf_id in subfolders[:50]: 
             if sf_id != folder_id:
                 all_files.extend(self.scan_recursive(sf_id, depth + 1, max_depth))
         
@@ -188,8 +190,9 @@ class DriveExtractor:
         total_episodes = 0
         total_count = len(all_entries)
         
+        # Use a more efficient grouping for large datasets
         for idx, (raw_name, url) in enumerate(all_entries, 1):
-            if self.progress_callback and idx % 5 == 0:
+            if self.progress_callback and (idx % 20 == 0 or idx == total_count):
                 self.progress_callback(f"⚙️ מעבד קובץ {idx} מתוך {total_count}...", current=idx, total=total_count)
                 
             quality = detect_quality(raw_name)

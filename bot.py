@@ -159,7 +159,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"🔄 **מעבד סדרה {i}/{total_links}...**\n📡 מתחבר לשרת...", 
                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("ביטול פעולה 🛑", callback_data='cancel_all')]]))
         
+        last_update_time = [0] # Use list for closure modification
         def progress(msg, current=None, total=None):
+            # Throttle updates to Telegram (max 1 update per 2 seconds) to avoid Rate Limits
+            current_time = time.time()
+            if current_time - last_update_time[0] < 2.0 and current is not None:
+                return
+            
+            last_update_time[0] = current_time
             try:
                 display_msg = f"🔄 **מעבד {i}/{total_links}...**\n{msg}"
                 if current is not None and total is not None:
@@ -223,10 +230,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_text += "📝 **פירוט:**\n" + "\n".join(series_details) + "\n\n"
     summary_text += CREDIT_LINE
     
+    # Send final summary as a NEW message to avoid collisions with progress bar
     try:
-        await status_msg.edit_text(summary_text, parse_mode='Markdown')
-    except:
-        await update.message.reply_text(summary_text, parse_mode='Markdown')
+        # Try to delete the progress message to clean up, then send summary
+        await status_msg.delete()
+    except: pass
+    
+    await update.message.reply_text(summary_text, parse_mode='Markdown')
     
     # Send consolidated file
     if success_count > 0:
