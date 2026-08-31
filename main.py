@@ -25,7 +25,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Booking Bot Advanced v3.0 🚀🤖"
+    return "Booking Bot Advanced v4.0 🚀🤖"
 
 def keep_alive():
     while True:
@@ -59,15 +59,15 @@ def get_random_user_agent():
     platform = random.choice(['windows', 'mac', 'mobile'])
     return random.choice(USER_AGENTS[platform]), platform
 
-# 2.2 פרוקסי (אופציונלי - ריק כברירת מחדל)
-PROXIES = []  # הוסף פרוקסי אם יש
+# 2.2 פרוקסי (אופציונלי)
+PROXIES = []
 
 def get_random_proxy():
     return random.choice(PROXIES) if PROXIES else None
 
 # 2.3 Viewport משתנה
 def get_random_viewport():
-    if random.random() < 0.3:  # 30% מובייל
+    if random.random() < 0.3:
         return {'width': random.choice([375, 390, 414]), 'height': random.choice([667, 812, 844, 896])}
     return {'width': random.choice([1366, 1440, 1536, 1920]), 'height': random.choice([768, 900, 1080, 1200])}
 
@@ -125,18 +125,15 @@ monitor = BookingScraperMonitor()
 
 # 2.6 פונקציות הגנה
 async def human_like_behavior(page):
-    # תנועות עכבר
     for _ in range(random.randint(3, 7)):
         x = random.randint(100, 800)
         y = random.randint(100, 600)
         await page.mouse.move(x, y, steps=random.randint(5, 15))
         await asyncio.sleep(random.uniform(0.05, 0.2))
-    # גלילות
     for _ in range(random.randint(2, 5)):
         scroll_amount = random.randint(100, 500)
         await page.mouse.wheel(0, scroll_amount)
         await asyncio.sleep(random.uniform(0.3, 1.0))
-    # עצירות אקראיות
     await asyncio.sleep(random.uniform(0.5, 2.0))
 
 async def intelligent_delay():
@@ -151,20 +148,13 @@ async def intelligent_delay():
 
 async def enhanced_stealth(page):
     await page.add_init_script("""
-        // הסתרת WebDriver
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // הסתרת Chrome Automation
         Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-        // זיוף window.chrome
         window.chrome = { runtime: {} };
-        // זיוף שפות
         Object.defineProperty(navigator, 'languages', { get: () => ['he-IL', 'he', 'en-US', 'en'] });
-        // הסתרת headless
         Object.defineProperty(navigator, 'headless', { get: () => false });
-        // זיוף screen
         Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
         Object.defineProperty(screen, 'availHeight', { get: () => 1080 });
-        // WebGL
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function(parameter) {
             if (parameter === 37445) return 'Intel Inc.';
@@ -209,20 +199,14 @@ async def manage_cookies(context):
 # ==================== 3. פונקציית הסריקה הראשית ====================
 
 async def fetch_booking_price(url: str):
-    # 3.1 דיליי חכם
     await intelligent_delay()
     
-    # 3.2 בחירת User-Agent
     ua, platform = get_random_user_agent()
     viewport = get_random_viewport()
     headers = get_random_headers(platform)
-    is_mobile = platform == 'mobile'
-    
-    # 3.3 פרוקסי
     proxy = get_random_proxy()
     
     async with async_playwright() as p:
-        # 3.4 הגדרות דפדפן
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -245,12 +229,9 @@ async def fetch_booking_price(url: str):
             proxy=proxy
         )
         
-        # 3.5 Cookies
         await manage_cookies(context)
-        
         page = await context.new_page()
         
-        # 3.6 Stealth
         await enhanced_stealth(page)
         if stealth_async:
             try:
@@ -258,50 +239,42 @@ async def fetch_booking_price(url: str):
             except:
                 pass
         
-        # 3.7 חסימת מדיה
         await page.route("**/*.{png,jpg,jpeg,gif,webp,ttf,woff,woff2,css,svg,ico}", lambda route: route.abort())
         
         try:
-            # 3.8 ניווט
             response = await page.goto(url, wait_until='domcontentloaded', timeout=60000)
             await asyncio.sleep(random.uniform(2, 4))
-            
-            # 3.9 התנהגות אנושית
             await human_like_behavior(page)
             
-            # 3.10 בדיקת חסימה
             if await detect_block(page):
                 monitor.record_attempt(False, 'Block detected')
                 await browser.close()
                 return False, None, 'האתר חסם את הבקשה', False, {}
             
-            # 3.11 בדיקת CAPTCHA
             if await detect_captcha(page):
                 monitor.record_attempt(False, 'CAPTCHA detected')
                 await browser.close()
                 return False, None, 'זוהתה CAPTCHA - מנסה שוב מאוחר יותר', False, {}
             
-            # ==================== 4. חילוץ נתונים ====================
             data = {}
             
-            # 4.1 שם מלון
+            # שם מלון
             hotel_name_elem = await page.query_selector('.hp__hotel-name, .d2fee87262, .pp-header__title, .bui-u-text-ellipsis--2')
             if hotel_name_elem:
                 data['hotel_name'] = (await hotel_name_elem.inner_text()).strip()
             else:
                 data['hotel_name'] = 'מלון לא מזוהה'
             
-            # 4.2 דירוג
+            # דירוג
             rating_elem = await page.query_selector('.bui-review-score__badge, .review-score-badge, .a3b8729ab1')
             if rating_elem:
                 data['hotel_rating'] = (await rating_elem.inner_text()).strip()
             else:
                 data['hotel_rating'] = 'N/A'
             
-            # 4.3 גוף דף לחיפוש טקסט
             body_text = await page.inner_text('body')
             
-            # 4.4 זיהוי ביטול חינם
+            # ביטול חינם
             data['free_cancellation'] = False
             if 'ביטול חינם' in body_text or 'free cancellation' in body_text.lower():
                 data['free_cancellation'] = True
@@ -311,14 +284,14 @@ async def fetch_booking_price(url: str):
                 else:
                     data['cancellation_deadline'] = None
             
-            # 4.5 ארוחת בוקר
+            # ארוחת בוקר
             data['includes_breakfast'] = 'ארוחת בוקר' in body_text or 'breakfast' in body_text.lower()
             
-            # 4.6 זיהוי מבצע
+            # זיהוי מבצע
             sale_keywords = ['מבצע', 'הנחה', 'סייל', 'sale', 'discount', 'save', 'חיסכון']
             data['sale_detected'] = any(k in body_text.lower() for k in sale_keywords)
             
-            # 4.7 זיהוי ביקוש (צופים)
+            # צופים
             viewers_elem = await page.query_selector('.hp-rt-people-viewing, [data-testid="people-viewing"]')
             data['viewers'] = 0
             if viewers_elem:
@@ -327,7 +300,7 @@ async def fetch_booking_price(url: str):
                 if viewers_match:
                     data['viewers'] = int(viewers_match.group(1))
             
-            # 4.8 זמינות נמוכה
+            # זמינות נמוכה
             data['low_availability'] = False
             rooms_left_elem = await page.query_selector('.room-last-booked, [data-testid="last-rooms"]')
             if rooms_left_elem:
@@ -336,7 +309,7 @@ async def fetch_booking_price(url: str):
                 if rooms_match and int(rooms_match.group(1)) <= 3:
                     data['low_availability'] = True
             
-            # 4.9 חילוץ מחיר
+            # חילוץ מחיר
             price_selectors = [
                 '.prco-val-bignum',
                 '.bd-price-value',
@@ -363,7 +336,7 @@ async def fetch_booking_price(url: str):
                     await browser.close()
                     return True, clean_price, None, data['sale_detected'], data
             
-            # 4.10 ניסיון חלופי - חיפוש כללי
+            # ניסיון חלופי
             prices = re.findall(r'₪\s*([\d,]+)', body_text)
             if prices:
                 clean_price = int(re.sub(r'[^\d]', '', prices[0]))
@@ -372,7 +345,6 @@ async def fetch_booking_price(url: str):
                 await browser.close()
                 return True, clean_price, None, data['sale_detected'], data
             
-            # 4.11 כשל
             monitor.record_attempt(False, 'No price found')
             await browser.close()
             return False, None, 'לא נמצא מחיר', False, data
@@ -382,10 +354,16 @@ async def fetch_booking_price(url: str):
             await browser.close()
             return False, None, str(e), False, {}
 
-# ==================== 5. מבני נתונים וממשק ====================
+# ==================== 4. מבני נתונים וממשק ====================
 tracked_hotels = {}
-WAITING_FOR_DATA = 1
+
+# מצבי שיחה
+WAITING_FOR_URL = 1
 WAITING_FOR_DATES = 2
+WAITING_FOR_YEAR = 3
+WAITING_FOR_PRICE = 4
+WAITING_FOR_FILTER = 5
+WAITING_FOR_FILTER_CHANGE = 6
 
 ROOM_TYPES = {
     'double': {'name': 'חדר זוגי', 'emoji': '🛏️'},
@@ -394,9 +372,10 @@ ROOM_TYPES = {
     'basic': {'name': 'חדר סטנדרט', 'emoji': '🏠'}
 }
 
-# 5.1 מקלדות
+# 4.1 מקלדות
 def get_main_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 בדיקת קישור", callback_data="btn_test")],
         [InlineKeyboardButton("➕ מעקב חדש", callback_data="btn_track")],
         [InlineKeyboardButton("📊 מצב מעקב", callback_data="btn_status")],
         [InlineKeyboardButton("⚙️ הגדרות", callback_data="advanced_settings")],
@@ -416,11 +395,76 @@ def get_advanced_keyboard():
         [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_main")]
     ])
 
-def get_room_keyboard():
+def get_filter_keyboard(chat_id):
+    data = tracked_hotels.get(chat_id, {})
+    buttons = []
+    
+    # מספר אנשים
+    guests = data.get('guests', 2)
+    buttons.append([InlineKeyboardButton(
+        f"👤 מספר אנשים: {guests}",
+        callback_data="filter_guests"
+    )])
+    
+    # מספר חדרים
+    rooms = data.get('rooms', 1)
+    buttons.append([InlineKeyboardButton(
+        f"🛏️ מספר חדרים: {rooms}",
+        callback_data="filter_rooms"
+    )])
+    
+    # סוג חדר
+    room_type = data.get('room_type', 'standard')
+    room_name = ROOM_TYPES.get(room_type, {}).get('name', 'סטנדרט')
+    buttons.append([InlineKeyboardButton(
+        f"🏨 סוג חדר: {room_name}",
+        callback_data="filter_room_type"
+    )])
+    
+    # ביטול חינם
+    cancellation = data.get('free_cancellation')
+    if cancellation is not None:
+        status = "✅" if cancellation else "❌"
+        buttons.append([InlineKeyboardButton(
+            f"🔄 ביטול חינם: {status}",
+            callback_data="filter_cancellation"
+        )])
+    
+    # ארוחת בוקר
+    breakfast = data.get('includes_breakfast')
+    if breakfast is not None:
+        status = "✅" if breakfast else "❌"
+        buttons.append([InlineKeyboardButton(
+            f"🍳 ארוחת בוקר: {status}",
+            callback_data="filter_breakfast"
+        )])
+    
+    # תדירות בדיקה
+    freq = data.get('check_frequency', 60)
+    buttons.append([InlineKeyboardButton(
+        f"⏱️ תדירות: {freq} דקות",
+        callback_data="filter_frequency"
+    )])
+    
+    # התראות
+    threshold = data.get('alert_threshold', 10)
+    buttons.append([InlineKeyboardButton(
+        f"🔔 התראה ב-{threshold}% ירידה",
+        callback_data="filter_alert"
+    )])
+    
+    # כפתורי פעולה
+    buttons.append([InlineKeyboardButton("🔄 איפוס סינונים", callback_data="filter_reset")])
+    buttons.append([InlineKeyboardButton("✅ סיימתי - המשך למעקב", callback_data="filter_done")])
+    buttons.append([InlineKeyboardButton("❌ ביטול", callback_data="filter_cancel")])
+    
+    return InlineKeyboardMarkup(buttons)
+
+def get_room_type_keyboard():
     buttons = []
     for k, v in ROOM_TYPES.items():
         buttons.append([InlineKeyboardButton(f"{v['emoji']} {v['name']}", callback_data=f"room_{k}")])
-    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="back_to_main")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="back_to_filter")])
     return InlineKeyboardMarkup(buttons)
 
 def get_frequency_keyboard():
@@ -429,7 +473,7 @@ def get_frequency_keyboard():
          InlineKeyboardButton("⏱️ 5 דקות", callback_data="freq_5")],
         [InlineKeyboardButton("⏱️ 15 דקות", callback_data="freq_15"),
          InlineKeyboardButton("⏱️ 60 דקות", callback_data="freq_60")],
-        [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_main")]
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_filter")]
     ])
 
 def get_alert_keyboard():
@@ -437,21 +481,41 @@ def get_alert_keyboard():
         [InlineKeyboardButton("📉 5% ירידה", callback_data="alert_5"),
          InlineKeyboardButton("📉 10% ירידה", callback_data="alert_10")],
         [InlineKeyboardButton("📉 20% ירידה", callback_data="alert_20"),
-         InlineKeyboardButton("📈 עליית מחיר", callback_data="alert_up")],
-        [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_main")]
+         InlineKeyboardButton("📉 30% ירידה", callback_data="alert_30")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_filter")]
     ])
 
-# ==================== 6. פקודות טלגרם ====================
+def get_people_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1 👤", callback_data="people_1"),
+         InlineKeyboardButton("2 👤👤", callback_data="people_2"),
+         InlineKeyboardButton("3 👤👤👤", callback_data="people_3")],
+        [InlineKeyboardButton("4 👤👤👤👤", callback_data="people_4"),
+         InlineKeyboardButton("5 👤👤👤👤👤", callback_data="people_5"),
+         InlineKeyboardButton("6+", callback_data="people_6")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_filter")]
+    ])
+
+def get_rooms_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1 🛏️", callback_data="rooms_1"),
+         InlineKeyboardButton("2 🛏️🛏️", callback_data="rooms_2"),
+         InlineKeyboardButton("3 🛏️🛏️🛏️", callback_data="rooms_3")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_to_filter")]
+    ])
+
+# ==================== 5. פקודות טלגרם ====================
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🎯 **ברוכים הבאים לבוט מעקב המחירים החכם!**\n\n"
-        "📌 **פקודות:**\n"
-        "• `/track <URL> <מחיר>` - מעקב מהיר\n"
-        "• `/status` - מצב נוכחי\n"
-        "• `/stop` - עצירת מעקב\n"
-        "• `/history` - היסטוריה\n"
-        "• `/list` - רשימת מעקבים\n\n"
-        "🔽 לחץ על הכפתורים למטה!"
+        "📌 **איך זה עובד:**\n"
+        "1️⃣ שלח קישור למלון\n"
+        "2️⃣ בחר תאריכים\n"
+        "3️⃣ הזן מחיר שמצאת (או דלג)\n"
+        "4️⃣ התאם סינונים חכמים\n"
+        "5️⃣ הבוט יעקוב ויתריע על ירידות מחיר!\n\n"
+        "🔽 לחץ על '➕ מעקב חדש' להתחלה!"
     )
     await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
@@ -460,28 +524,268 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = update.effective_chat.id
 
+    # === מעקב חדש ===
     if query.data == "btn_track":
+        if chat_id in tracked_hotels:
+            await query.message.reply_text(
+                "⚠️ כבר יש לך מעקב פעיל!\n"
+                "אם תרצה להתחיל מחדש - עצור את המעקב הקודם.",
+                reply_markup=get_main_keyboard()
+            )
+            return ConversationHandler.END
+        
+        tracked_hotels[chat_id] = {
+            'url': None,
+            'check_in': None,
+            'check_out': None,
+            'guests': 2,
+            'rooms': 1,
+            'room_type': 'standard',
+            'free_cancellation': False,
+            'includes_breakfast': False,
+            'priority_sales': False,
+            'user_price': None,
+            'best_price': None,
+            'last_price': None,
+            'history': [],
+            'alert_threshold': 10,
+            'alert_on_up': False,
+            'check_frequency': 60,
+            'last_check': datetime.now(),
+            'hotel_name': 'ממתין להגדרה'
+        }
+        
         await query.message.reply_text(
-            "📝 שלח קישור ומחיר:\n`<קישור> <מחיר>`\nלמשל:\n`https://www.booking.com/hotel/il/x 500`",
+            "📤 **שלח קישור למלון**\n\n"
+            "לחץ על 'שתף' באפליקציית Booking.com והדבק כאן.\n"
+            "לדוגמה:\n"
+            "`https://www.booking.com/Share-ALqQ48w`\n\n"
+            "או קישור רגיל:\n"
+            "`https://www.booking.com/hotel/il/x`",
             parse_mode='Markdown'
         )
-        return WAITING_FOR_DATA
+        return WAITING_FOR_URL
+
+    # === בדיקת קישור ===
+    elif query.data == "btn_test":
+        await query.message.reply_text(
+            "🧪 **שלח קישור לבדיקה**\n\n"
+            "הבוט יסרוק את המלון ויציג את כל הנתונים\n"
+            "בלי להתחיל מעקב.\n\n"
+            "לדוגמה:\n"
+            "`https://www.booking.com/Share-ALqQ48w`",
+            parse_mode='Markdown'
+        )
+        return WAITING_FOR_URL
+
+    # === כפתורי סינון ===
+    elif query.data.startswith("people_"):
+        num = int(query.data.split("_")[1])
+        if num == 6:
+            await query.message.reply_text("📝 כמה אנשים? (שלח מספר)")
+            return WAITING_FOR_FILTER
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['guests'] = num
+            await query.message.reply_text(
+                f"✅ מספר אנשים: {num}",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data.startswith("rooms_"):
+        num = int(query.data.split("_")[1])
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['rooms'] = num
+            await query.message.reply_text(
+                f"✅ מספר חדרים: {num}",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_guests":
+        await query.message.reply_text("👤 בחר מספר אנשים:", reply_markup=get_people_keyboard())
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_rooms":
+        await query.message.reply_text("🛏️ בחר מספר חדרים:", reply_markup=get_rooms_keyboard())
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_room_type":
+        await query.message.reply_text("🛏️ בחר סוג חדר:", reply_markup=get_room_type_keyboard())
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_cancellation":
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['free_cancellation'] = not tracked_hotels[chat_id].get('free_cancellation', False)
+            await query.message.reply_text(
+                f"🔄 ביטול חינם: {'✅' if tracked_hotels[chat_id]['free_cancellation'] else '❌'}",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_breakfast":
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['includes_breakfast'] = not tracked_hotels[chat_id].get('includes_breakfast', False)
+            await query.message.reply_text(
+                f"🍳 ארוחת בוקר: {'✅' if tracked_hotels[chat_id]['includes_breakfast'] else '❌'}",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_frequency":
+        await query.message.reply_text("⏱️ בחר תדירות בדיקה:", reply_markup=get_frequency_keyboard())
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_alert":
+        await query.message.reply_text("🔔 בחר אחוז ירידה להתראה:", reply_markup=get_alert_keyboard())
+        return WAITING_FOR_FILTER
+
+    elif query.data.startswith("freq_"):
+        freq = int(query.data.split("_")[1])
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['check_frequency'] = freq
+            await query.message.reply_text(
+                f"⏱️ תדירות: כל {freq} דקות",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data.startswith("alert_"):
+        threshold = int(query.data.split("_")[1])
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['alert_threshold'] = threshold
+            await query.message.reply_text(
+                f"🔔 התראה ב-{threshold}% ירידה",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
 
     elif query.data.startswith("room_"):
         room_key = query.data.split("_")[1]
         if chat_id in tracked_hotels:
             tracked_hotels[chat_id]['room_type'] = room_key
             await query.message.reply_text(
-                f"✅ סוג חדר: {ROOM_TYPES[room_key]['emoji']} {ROOM_TYPES[room_key]['name']}",
-                reply_markup=get_main_keyboard()
+                f"✅ סוג חדר: {ROOM_TYPES[room_key]['name']}",
+                reply_markup=get_filter_keyboard(chat_id)
             )
-        else:
-            await query.message.reply_text("⚠️ אין מעקב פעיל.", reply_markup=get_main_keyboard())
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_reset":
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['guests'] = 2
+            tracked_hotels[chat_id]['rooms'] = 1
+            tracked_hotels[chat_id]['room_type'] = 'standard'
+            tracked_hotels[chat_id]['free_cancellation'] = False
+            tracked_hotels[chat_id]['includes_breakfast'] = False
+            tracked_hotels[chat_id]['alert_threshold'] = 10
+            tracked_hotels[chat_id]['check_frequency'] = 60
+            await query.message.reply_text(
+                "🔄 **איפוס סינונים!**\nכל ההגדרות חזרו לברירת מחדל.",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data == "filter_done":
+        if chat_id in tracked_hotels:
+            data = tracked_hotels[chat_id]
+            if not data.get('url'):
+                await query.message.reply_text("⚠️ חסר קישור! התחל מחדש.")
+                return ConversationHandler.END
+            if not data.get('check_in') or not data.get('check_out'):
+                await query.message.reply_text("⚠️ חסרים תאריכים! התחל מחדש.")
+                return ConversationHandler.END
+            
+            # ביצוע סריקה ראשונית
+            await query.message.reply_text("🔍 **מבצע סריקה ראשונית...**")
+            
+            success, price, error, sale, info = await fetch_booking_price(data['url'])
+            
+            if success and price:
+                data['last_price'] = price
+                if not data['best_price']:
+                    data['best_price'] = price
+                if info.get('hotel_name'):
+                    data['hotel_name'] = info['hotel_name']
+                
+                # השוואה למחיר המשתמש
+                msg = "✅ **המעקב הוגדר בהצלחה!**\n\n"
+                msg += f"🏨 **מלון:** {data['hotel_name']}\n"
+                if data.get('user_price'):
+                    msg += f"💰 **המחיר שמצאת:** ₪{data['user_price']}\n"
+                msg += f"🔥 **מחיר נוכחי:** ₪{price}\n"
+                
+                if data.get('user_price') and price < data['user_price']:
+                    savings = data['user_price'] - price
+                    percent = (savings / data['user_price']) * 100
+                    msg += f"🎉 **חיסכון:** ₪{savings} ({percent:.1f}%)\n"
+                    msg += f"✅ **כבר שווה!**\n"
+                elif data.get('user_price') and price > data['user_price']:
+                    msg += f"⚠️ **המחיר גבוה יותר** ממה שמצאת\n"
+                    msg += f"💡 הבוט יעקוב ויתריע על ירידות\n"
+                else:
+                    msg += f"💡 הבוט יעקוב ויתריע על ירידות\n"
+                
+                msg += f"\n📅 **תאריכים:** {data['check_in']} → {data['check_out']}\n"
+                msg += f"👤 **אורחים:** {data['guests']}\n"
+                msg += f"🛏️ **חדרים:** {data['rooms']}\n"
+                msg += f"⏱️ **תדירות:** כל {data['check_frequency']} דקות"
+                
+                await query.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+                
+                # הוספת היסטוריה
+                data['history'].append({
+                    'date': datetime.now(),
+                    'price': price,
+                    'sale': sale,
+                    'user_price': data.get('user_price')
+                })
+                
+                return ConversationHandler.END
+            else:
+                await query.message.reply_text(
+                    f"❌ **שגיאה בסריקה:**\n{error}\n\n"
+                    "🔧 נסה שוב או בדוק את הקישור.",
+                    reply_markup=get_main_keyboard()
+                )
+                return ConversationHandler.END
+        return ConversationHandler.END
+
+    elif query.data == "filter_cancel" or query.data == "back_to_filter":
+        if chat_id in tracked_hotels:
+            await query.message.reply_text(
+                "🔙 חזרה לסינונים",
+                reply_markup=get_filter_keyboard(chat_id)
+            )
+        return WAITING_FOR_FILTER
+
+    elif query.data == "back_to_main":
+        await query.message.reply_text("🏠 חזרה", reply_markup=get_main_keyboard())
+        return ConversationHandler.END
+
+    # === יתר הכפתורים ===
+    elif query.data == "btn_status":
+        await status_command(update, context)
+        return ConversationHandler.END
+
+    elif query.data == "btn_stop":
+        await stop_command(update, context)
+        return ConversationHandler.END
+
+    elif query.data == "advanced_settings":
+        await query.message.reply_text("⚙️ **הגדרות מתקדמות**", reply_markup=get_advanced_keyboard())
+        return ConversationHandler.END
+
+    elif query.data == "change_room":
+        await query.message.reply_text("🛏️ **בחר סוג חדר:**", reply_markup=get_room_type_keyboard())
         return ConversationHandler.END
 
     elif query.data == "change_dates":
         await query.message.reply_text(
-            "📅 שלח תאריכים: `YYYY-MM-DD YYYY-MM-DD`\nלמשל: `2026-09-01 2026-09-05`",
+            "📅 **שינוי מועדים**\n\n"
+            "שלח תאריכים חדשים:\n"
+            "`YYYY-MM-DD YYYY-MM-DD`\n\n"
+            "למשל:\n"
+            "`2026-09-01 2026-09-05`",
             parse_mode='Markdown'
         )
         return WAITING_FOR_DATES
@@ -489,10 +793,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "toggle_cancellation":
         if chat_id in tracked_hotels:
             tracked_hotels[chat_id]['free_cancellation'] = not tracked_hotels[chat_id].get('free_cancellation', False)
-            status = "✅ פעיל" if tracked_hotels[chat_id]['free_cancellation'] else "❌ לא פעיל"
-            await query.message.reply_text(f"🔄 ביטול חינם: {status}", reply_markup=get_main_keyboard())
-        else:
-            await query.message.reply_text("⚠️ אין מעקב פעיל.", reply_markup=get_main_keyboard())
+            await query.message.reply_text(
+                f"🔄 ביטול חינם: {'✅' if tracked_hotels[chat_id]['free_cancellation'] else '❌'}",
+                reply_markup=get_main_keyboard()
+            )
         return ConversationHandler.END
 
     elif query.data == "show_history":
@@ -507,41 +811,6 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await export_data(update, context)
         return ConversationHandler.END
 
-    elif query.data.startswith("alert_"):
-        threshold = query.data.split("_")[1]
-        if chat_id in tracked_hotels:
-            tracked_hotels[chat_id]['alert_threshold'] = int(threshold)
-            await query.message.reply_text(f"🔔 התראה הוגדרה ל-{threshold}% ירידה", reply_markup=get_main_keyboard())
-        else:
-            await query.message.reply_text("⚠️ אין מעקב פעיל.", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-
-    elif query.data == "alert_up":
-        if chat_id in tracked_hotels:
-            tracked_hotels[chat_id]['alert_on_up'] = not tracked_hotels[chat_id].get('alert_on_up', False)
-            status = "✅ פעיל" if tracked_hotels[chat_id]['alert_on_up'] else "❌ לא פעיל"
-            await query.message.reply_text(f"📈 התראות עלייה: {status}", reply_markup=get_main_keyboard())
-        else:
-            await query.message.reply_text("⚠️ אין מעקב פעיל.", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-
-    elif query.data.startswith("freq_"):
-        freq = int(query.data.split("_")[1])
-        if chat_id in tracked_hotels:
-            tracked_hotels[chat_id]['check_frequency'] = freq
-            await query.message.reply_text(f"⏱️ תדירות: כל {freq} דקות", reply_markup=get_main_keyboard())
-        else:
-            await query.message.reply_text("⚠️ אין מעקב פעיל.", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-
-    elif query.data == "advanced_settings":
-        await query.message.reply_text("⚙️ **הגדרות מתקדמות**", reply_markup=get_advanced_keyboard())
-        return ConversationHandler.END
-
-    elif query.data == "change_room":
-        await query.message.reply_text("🛏️ **בחר סוג חדר:**", reply_markup=get_room_keyboard())
-        return ConversationHandler.END
-
     elif query.data == "change_frequency":
         await query.message.reply_text("⏱️ **בחר תדירות:**", reply_markup=get_frequency_keyboard())
         return ConversationHandler.END
@@ -550,212 +819,462 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🔔 **הגדרות התראות:**", reply_markup=get_alert_keyboard())
         return ConversationHandler.END
 
-    elif query.data == "back_to_main":
-        await query.message.reply_text("🏠 חזרה", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-
-    elif query.data == "btn_status":
-        await status_command(update, context)
-        return ConversationHandler.END
-
-    elif query.data == "btn_stop":
-        await stop_command(update, context)
-        return ConversationHandler.END
-
     return ConversationHandler.END
 
 async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-    parts = text.split()
-
-    # בדיקת תאריכים
-    if len(parts) == 2 and re.match(r'\d{4}-\d{2}-\d{2}', parts[0]):
-        try:
-            check_in = datetime.strptime(parts[0], '%Y-%m-%d')
-            check_out = datetime.strptime(parts[1], '%Y-%m-%d')
-            if check_in < datetime.now():
-                await update.message.reply_text("❌ תאריך כניסה חייב להיות בעתיד")
-                return WAITING_FOR_DATES
-            if check_out <= check_in:
-                await update.message.reply_text("❌ תאריך יציאה חייב להיות אחרי כניסה")
-                return WAITING_FOR_DATES
-            if chat_id in tracked_hotels:
-                tracked_hotels[chat_id]['check_in'] = parts[0]
-                tracked_hotels[chat_id]['check_out'] = parts[1]
-                await update.message.reply_text(f"✅ מועדים: {parts[0]} → {parts[1]}", reply_markup=get_main_keyboard())
-                return ConversationHandler.END
-            else:
-                await update.message.reply_text("⚠️ אין מעקב פעיל", reply_markup=get_main_keyboard())
-                return ConversationHandler.END
-        except:
-            await update.message.reply_text("❌ פורמט לא תקין. נסה: YYYY-MM-DD YYYY-MM-DD")
-            return WAITING_FOR_DATES
-
-    # קישור + מחיר
-    if len(parts) >= 2:
-        url = parts[0]
-        try:
-            price = int(parts[1])
+    
+    # === מצב: מחכה לקישור ===
+    if context.user_data.get('state') == WAITING_FOR_URL or chat_id not in tracked_hotels:
+        # ניקוי קישור
+        url = text.split()[0] if text.split() else text
+        
+        # בדיקה אם זה קישור Booking
+        if 'booking.com' not in url.lower():
+            await update.message.reply_text(
+                "❌ **קישור לא תקין**\n\n"
+                "שלח קישור מ-Booking.com בלבד.\n"
+                "למשל:\n"
+                "`https://www.booking.com/Share-ALqQ48w`",
+                parse_mode='Markdown'
+            )
+            context.user_data['state'] = WAITING_FOR_URL
+            return WAITING_FOR_URL
+        
+        # שמירת הקישור
+        if chat_id not in tracked_hotels:
             tracked_hotels[chat_id] = {
-                'url': url,
-                'target_price': price,
-                'room_type': 'standard',
-                'free_cancellation': False,
-                'cancellation_deadline': None,
-                'includes_breakfast': False,
-                'hotel_rating': 'N/A',
-                'viewers': 0,
-                'low_availability': False,
+                'url': None,
                 'check_in': None,
                 'check_out': None,
                 'guests': 2,
                 'rooms': 1,
+                'room_type': 'standard',
+                'free_cancellation': False,
+                'includes_breakfast': False,
+                'priority_sales': False,
+                'user_price': None,
+                'best_price': None,
+                'last_price': None,
                 'history': [],
                 'alert_threshold': 10,
                 'alert_on_up': False,
                 'check_frequency': 60,
                 'last_check': datetime.now(),
-                'sale_detected': False,
-                'hotel_name': 'ממתין לבדיקה'
+                'hotel_name': 'ממתין להגדרה'
             }
+        
+        tracked_hotels[chat_id]['url'] = url
+        
+        # סריקה מהירה לאימות
+        await update.message.reply_text("🔍 **בודק קישור...**")
+        success, price, error, sale, info = await fetch_booking_price(url)
+        
+        if success and price:
+            tracked_hotels[chat_id]['hotel_name'] = info.get('hotel_name', 'מלון')
+            tracked_hotels[chat_id]['last_price'] = price
+            tracked_hotels[chat_id]['best_price'] = price
+            
             await update.message.reply_text(
-                f"✅ **מעקב הוגדר!**\n💰 מחיר יעד: ₪{price}\n⏱️ בדיקה כל 1 דקה",
-                reply_markup=get_main_keyboard(),
+                f"✅ **קישור נקלט בהצלחה!**\n\n"
+                f"🏨 **מלון:** {info.get('hotel_name', 'לא ידוע')}\n"
+                f"💰 **מחיר נוכחי:** ₪{price}\n"
+                f"⭐ **דירוג:** {info.get('hotel_rating', 'N/A')}\n\n"
+                f"📅 **עכשיו שלח תאריכים:**\n"
+                f"(למשל: `2.8-2.9` או `2.8.2027-2.9.2027`)",
                 parse_mode='Markdown'
             )
+            context.user_data['state'] = WAITING_FOR_DATES
+            return WAITING_FOR_DATES
+        else:
+            await update.message.reply_text(
+                f"❌ **הקישור לא נקלט**\n\n"
+                f"שגיאה: {error}\n\n"
+                "🔧 נסה שוב עם קישור אחר.",
+                reply_markup=get_main_keyboard()
+            )
+            context.user_data['state'] = None
             return ConversationHandler.END
+    
+    # === מצב: מחכה לתאריכים ===
+    elif context.user_data.get('state') == WAITING_FOR_DATES:
+        dates = parse_dates(text)
+        
+        if not dates:
+            await update.message.reply_text(
+                "❌ **פורמט לא תקין**\n\n"
+                "שלח תאריכים באחד מהפורמטים:\n"
+                "• `2.8-2.9` (אותה שנה)\n"
+                "• `2.8.2027-2.9.2027`\n"
+                "• `2/8-2/9`\n"
+                "• `2.8 עד 2.9`",
+                parse_mode='Markdown'
+            )
+            return WAITING_FOR_DATES
+        
+        check_in, check_out = dates
+        
+        # בדיקת שנה
+        if check_in.year == 1900 or check_out.year == 1900:
+            await update.message.reply_text(
+                "📅 **איזו שנה?**\n\n"
+                "לא זיהיתי שנה, אנא בחר:\n"
+                "שלח `2026`, `2027` או שנה אחרת",
+                parse_mode='Markdown'
+            )
+            context.user_data['temp_dates'] = (check_in, check_out)
+            context.user_data['state'] = WAITING_FOR_YEAR
+            return WAITING_FOR_YEAR
+        
+        # שמירת תאריכים
+        if chat_id in tracked_hotels:
+            tracked_hotels[chat_id]['check_in'] = check_in.strftime('%Y-%m-%d')
+            tracked_hotels[chat_id]['check_out'] = check_out.strftime('%Y-%m-%d')
+            
+            await update.message.reply_text(
+                f"✅ **תאריכים נקלטו!**\n"
+                f"📅 {check_in.strftime('%d/%m/%Y')} → {check_out.strftime('%d/%m/%Y')}\n\n"
+                f"💰 **עכשיו שלח מחיר שמצאת** (או שלח `דלג`):\n"
+                f"אם יש לך מחיר ממקור אחר - שלח אותו,\n"
+                f"אחרת הבוט ישתמש במחיר הנוכחי.",
+                parse_mode='Markdown'
+            )
+            context.user_data['state'] = WAITING_FOR_PRICE
+            return WAITING_FOR_PRICE
+        
+        context.user_data['state'] = None
+        return ConversationHandler.END
+    
+    # === מצב: מחכה לשנה ===
+    elif context.user_data.get('state') == WAITING_FOR_YEAR:
+        try:
+            year = int(text.strip())
+            if year < 2020 or year > 2030:
+                await update.message.reply_text("❌ שנה לא תקינה. שלח 2020-2030")
+                return WAITING_FOR_YEAR
+            
+            check_in, check_out = context.user_data.get('temp_dates', (None, None))
+            if check_in and check_out:
+                check_in = check_in.replace(year=year)
+                check_out = check_out.replace(year=year)
+                
+                if chat_id in tracked_hotels:
+                    tracked_hotels[chat_id]['check_in'] = check_in.strftime('%Y-%m-%d')
+                    tracked_hotels[chat_id]['check_out'] = check_out.strftime('%Y-%m-%d')
+                    
+                    await update.message.reply_text(
+                        f"✅ **תאריכים נקלטו!**\n"
+                        f"📅 {check_in.strftime('%d/%m/%Y')} → {check_out.strftime('%d/%m/%Y')}\n\n"
+                        f"💰 **עכשיו שלח מחיר שמצאת** (או שלח `דלג`):",
+                        parse_mode='Markdown'
+                    )
+                    context.user_data['state'] = WAITING_FOR_PRICE
+                    return WAITING_FOR_PRICE
         except:
-            await update.message.reply_text("❌ המחיר חייב להיות מספר", reply_markup=get_main_keyboard())
-            return WAITING_FOR_DATA
-
-    await update.message.reply_text("❌ פורמט לא תקין. שלח: `<קישור> <מחיר>`", parse_mode='Markdown')
-    return WAITING_FOR_DATA
-
-async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        url, price = context.args[0], int(context.args[1])
-        chat_id = update.effective_chat.id
-        tracked_hotels[chat_id] = {
-            'url': url, 'target_price': price, 'room_type': 'standard',
-            'free_cancellation': False, 'cancellation_deadline': None,
-            'includes_breakfast': False, 'hotel_rating': 'N/A',
-            'viewers': 0, 'low_availability': False,
-            'check_in': None, 'check_out': None,
-            'guests': 2, 'rooms': 1,
-            'history': [], 'alert_threshold': 10,
-            'alert_on_up': False, 'check_frequency': 60,
-            'last_check': datetime.now(), 'sale_detected': False,
-            'hotel_name': 'ממתין לבדיקה'
-        }
+            await update.message.reply_text("❌ שלח שנה תקינה (למשל: 2027)")
+            return WAITING_FOR_YEAR
+        
+        context.user_data['state'] = None
+        return ConversationHandler.END
+    
+    # === מצב: מחכה למחיר ===
+    elif context.user_data.get('state') == WAITING_FOR_PRICE:
+        if text.lower() == 'דלג' or text.lower() == 'skip':
+            if chat_id in tracked_hotels:
+                await update.message.reply_text(
+                    "✅ **דילגת על מחיר**\n\n"
+                    "הבוט ישתמש במחיר הנוכחי.\n"
+                    "🛠️ כעת נכנס למסך **סינון חכם** - התאם את ההגדרות:\n\n"
+                    "• מספר אנשים\n"
+                    "• סוג חדר\n"
+                    "• ביטול חינם\n"
+                    "• ועוד...",
+                    reply_markup=get_filter_keyboard(chat_id)
+                )
+                context.user_data['state'] = WAITING_FOR_FILTER
+                return WAITING_FOR_FILTER
+        else:
+            try:
+                price = int(re.sub(r'[^\d]', '', text))
+                if price <= 0:
+                    await update.message.reply_text("❌ שלח מחיר חיובי")
+                    return WAITING_FOR_PRICE
+                
+                if chat_id in tracked_hotels:
+                    tracked_hotels[chat_id]['user_price'] = price
+                    
+                    await update.message.reply_text(
+                        f"✅ **מחיר נקלט!** ₪{price}\n\n"
+                        "🛠️ כעת נכנס למסך **סינון חכם** - התאם את ההגדרות:\n\n"
+                        "• מספר אנשים\n"
+                        "• סוג חדר\n"
+                        "• ביטול חינם\n"
+                        "• ועוד...\n\n"
+                        "לחץ על 'סיימתי - המשך למעקב' כשתסיים.",
+                        reply_markup=get_filter_keyboard(chat_id)
+                    )
+                    context.user_data['state'] = WAITING_FOR_FILTER
+                    return WAITING_FOR_FILTER
+            except:
+                await update.message.reply_text("❌ שלח מספר תקין או 'דלג'")
+                return WAITING_FOR_PRICE
+        
+        context.user_data['state'] = None
+        return ConversationHandler.END
+    
+    # === מצב: סינון ===
+    elif context.user_data.get('state') == WAITING_FOR_FILTER:
         await update.message.reply_text(
-            f"✅ מעקב הוגדר! יעד: ₪{price}", reply_markup=get_main_keyboard()
+            "🛠️ השתמש בכפתורים כדי לשנות סינונים,\n"
+            "או לחץ על 'סיימתי - המשך למעקב'",
+            reply_markup=get_filter_keyboard(chat_id)
         )
-    except:
-        await update.message.reply_text("❌ /track <URL> <מחיר>")
+        return WAITING_FOR_FILTER
+    
+    # === ברירת מחדל ===
+    await update.message.reply_text(
+        "❓ לא הבנתי.\n"
+        "לחץ על כפתור '➕ מעקב חדש' להתחלה.",
+        reply_markup=get_main_keyboard()
+    )
+    return ConversationHandler.END
+
+# פונקציית עזר לניתוח תאריכים
+def parse_dates(text: str) -> tuple:
+    """פונקציה שמנתחת תאריכים ממחרוזת"""
+    current_year = datetime.now().year
+    
+    # ניסיון פורמטים שונים
+    patterns = [
+        # 2.8-2.9 (שנה נוכחית)
+        (r'(\d{1,2})\.(\d{1,2})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})', 
+         lambda m: (datetime(current_year, int(m[2]), int(m[1])),
+                   datetime(current_year, int(m[4]), int(m[3])))),
+        # 2.8.2027-2.9.2027 (עם שנה)
+        (r'(\d{1,2})\.(\d{1,2})\.(\d{4})\s*[-–—]\s*(\d{1,2})\.(\d{1,2})\.(\d{4})',
+         lambda m: (datetime(int(m[3]), int(m[2]), int(m[1])),
+                   datetime(int(m[6]), int(m[5]), int(m[4])))),
+        # 2/8-2/9
+        (r'(\d{1,2})/(\d{1,2})\s*[-–—]\s*(\d{1,2})/(\d{1,2})',
+         lambda m: (datetime(current_year, int(m[2]), int(m[1])),
+                   datetime(current_year, int(m[4]), int(m[3])))),
+        # 2.8 עד 2.9
+        (r'(\d{1,2})\.(\d{1,2})\s*עד\s*(\d{1,2})\.(\d{1,2})',
+         lambda m: (datetime(current_year, int(m[2]), int(m[1])),
+                   datetime(current_year, int(m[4]), int(m[3])))),
+        # 2.8.2027 עד 2.9.2027
+        (r'(\d{1,2})\.(\d{1,2})\.(\d{4})\s*עד\s*(\d{1,2})\.(\d{1,2})\.(\d{4})',
+         lambda m: (datetime(int(m[3]), int(m[2]), int(m[1])),
+                   datetime(int(m[6]), int(m[5]), int(m[4])))),
+    ]
+    
+    for pattern, func in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return func(match.groups())
+            except:
+                continue
+    
+    # ניסיון חלופי - חיפוש תאריכים בודדים
+    date_pattern = r'(\d{1,2})[./](\d{1,2})(?:[./](\d{4}))?'
+    dates = re.findall(date_pattern, text)
+    if len(dates) >= 2:
+        try:
+            # תאריך ראשון
+            if dates[0][2]:
+                d1 = datetime(int(dates[0][2]), int(dates[0][1]), int(dates[0][0]))
+            else:
+                d1 = datetime(current_year, int(dates[0][1]), int(dates[0][0]))
+            
+            # תאריך שני
+            if dates[1][2]:
+                d2 = datetime(int(dates[1][2]), int(dates[1][1]), int(dates[1][0]))
+            else:
+                d2 = datetime(current_year, int(dates[1][1]), int(dates[1][0]))
+            
+            if d1 and d2 and d2 > d1:
+                return (d1, d2)
+        except:
+            pass
+    
+    return None
+
+# ==================== 6. פקודות מעקב ====================
+
+async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """בדיקת קישור חד-פעמית"""
+    if not context.args:
+        await update.message.reply_text(
+            "🧪 **בדיקת קישור**\n\n"
+            "שלח: `/test <קישור>`\n"
+            "למשל: `/test https://www.booking.com/Share-ALqQ48w`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    url = context.args[0]
+    msg = await update.message.reply_text("⏳ **בודק...** זה יכול לקחת 10-20 שניות")
+    
+    success, price, error, sale, info = await fetch_booking_price(url)
+    
+    if success:
+        result = (
+            "🧪 **תוצאות הבדיקה:**\n\n"
+            f"🏨 **מלון:** {info.get('hotel_name', 'לא ידוע')}\n"
+            f"💰 **מחיר:** ₪{price}\n"
+            f"⭐ **דירוג:** {info.get('hotel_rating', 'N/A')}\n"
+            f"🔄 **ביטול חינם:** {'✅' if info.get('free_cancellation') else '❌'}\n"
+            f"🍳 **ארוחת בוקר:** {'✅' if info.get('includes_breakfast') else '❌'}\n"
+            f"🔥 **מבצע:** {'✅' if sale else '❌'}\n"
+            f"👀 **צופים:** {info.get('viewers', 0)}\n"
+            f"⚠️ **כמעט אזל:** {'✅' if info.get('low_availability') else '❌'}\n\n"
+            "✅ **הסריקה עבדה בהצלחה!**\n"
+            "לחץ על '➕ מעקב חדש' כדי להתחיל לעקוב."
+        )
+        await msg.edit_text(result, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    else:
+        await msg.edit_text(
+            f"❌ **שגיאה בבדיקה:**\n{error}\n\n"
+            "🔧 **טיפים:**\n"
+            "• ודא שהקישור תקין\n"
+            "• ודא שהמלון זמין\n"
+            "• המתן 30 שניות ונסה שוב",
+            reply_markup=get_main_keyboard()
+        )
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     target = update.message or update.callback_query.message
+    
     if chat_id not in tracked_hotels:
         await target.reply_text("ℹ️ אין מעקב פעיל", reply_markup=get_main_keyboard())
         return
-    d = tracked_hotels[chat_id]
-    room_name = ROOM_TYPES.get(d.get('room_type', 'standard'), {}).get('name', 'סטנדרט')
-    msg = (
-        f"📊 **מצב מעקב**\n"
-        f"🏨 {d.get('hotel_name', 'לא ידוע')}\n"
-        f"💰 יעד: ₪{d['target_price']}\n"
-        f"🛏️ {room_name}\n"
-        f"🔄 ביטול: {'✅' if d.get('free_cancellation') else '❌'}\n"
-        f"⏱️ תדירות: {d.get('check_frequency', 60)} דקות\n"
-        f"📊 היסטוריה: {len(d.get('history', []))} בדיקות"
-    )
-    if d.get('check_in') and d.get('check_out'):
-        msg += f"\n📅 {d['check_in']} → {d['check_out']}"
-    if d.get('hotel_rating') and d['hotel_rating'] != 'N/A':
-        msg += f"\n⭐ {d['hotel_rating']}"
-    if d.get('viewers', 0) > 10:
-        msg += f"\n👀 {d['viewers']} צופים"
-    if d.get('low_availability'):
-        msg += "\n⚠️ **כמעט אזל!**"
+    
+    data = tracked_hotels[chat_id]
+    room_name = ROOM_TYPES.get(data.get('room_type', 'standard'), {}).get('name', 'סטנדרט')
+    
+    msg = f"📊 **מצב מעקב**\n"
+    msg += f"🏨 {data.get('hotel_name', 'לא ידוע')}\n"
+    
+    if data.get('user_price'):
+        msg += f"💰 **המחיר שמצאת:** ₪{data['user_price']}\n"
+    if data.get('best_price'):
+        msg += f"🔥 **המחיר הזול ביותר:** ₪{data['best_price']}\n"
+        if data.get('user_price') and data['user_price'] > data['best_price']:
+            savings = data['user_price'] - data['best_price']
+            msg += f"🎉 **חיסכון:** ₪{savings} ({savings/data['user_price']*100:.1f}%)\n"
+    
+    msg += f"📅 {data.get('check_in', 'N/A')} → {data.get('check_out', 'N/A')}\n"
+    msg += f"👤 {data.get('guests', 2)} אורחים\n"
+    msg += f"🛏️ {room_name}\n"
+    msg += f"🔄 ביטול: {'✅' if data.get('free_cancellation') else '❌'}\n"
+    msg += f"⏱️ תדירות: {data.get('check_frequency', 60)} דקות\n"
+    msg += f"📊 היסטוריה: {len(data.get('history', []))} בדיקות"
+    
     await target.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     target = update.message or update.callback_query.message
+    
     if tracked_hotels.pop(chat_id, None):
-        await target.reply_text("🛑 המעקב הופסק", reply_markup=get_main_keyboard())
+        await target.reply_text("🛑 **המעקב הופסק**\n\nניתן להתחיל מעקב חדש בכל עת.", reply_markup=get_main_keyboard())
     else:
         await target.reply_text("ℹ️ אין מעקב פעיל", reply_markup=get_main_keyboard())
 
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     target = update.message or update.callback_query.message
+    
     if chat_id not in tracked_hotels:
         await target.reply_text("⚠️ אין מעקב", reply_markup=get_main_keyboard())
         return
+    
     history = tracked_hotels[chat_id].get('history', [])
     if not history:
-        await target.reply_text("📊 אין היסטוריה", reply_markup=get_main_keyboard())
+        await target.reply_text("📊 אין היסטוריה עדיין", reply_markup=get_main_keyboard())
         return
+    
     recent = history[-10:]
-    msg = "📊 **היסטוריה (10 אחרונות):**\n"
+    msg = "📊 **היסטוריית מחירים (10 אחרונות):**\n\n"
     for i, entry in enumerate(reversed(recent), 1):
         dt = entry.get('date', datetime.now()).strftime('%d/%m %H:%M')
-        p = entry.get('price', '?')
-        msg += f"{i}. {dt} - ₪{p}"
+        price = entry.get('price', '?')
+        msg += f"{i}. {dt} - ₪{price}"
         if entry.get('sale'):
             msg += " 🔥"
+        if entry.get('user_price'):
+            savings = entry['user_price'] - price
+            if savings > 0:
+                msg += f" 💰 חיסכון: ₪{savings}"
         msg += "\n"
+    
     await target.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def list_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     target = update.message or update.callback_query.message
+    
     if chat_id not in tracked_hotels:
         await target.reply_text("⚠️ אין מעקבים", reply_markup=get_main_keyboard())
         return
+    
     d = tracked_hotels[chat_id]
-    msg = f"📋 **המעקב שלך**\n🏨 {d.get('hotel_name', 'לא ידוע')}\n💰 ₪{d['target_price']}\n📊 {len(d.get('history', []))} בדיקות"
+    msg = f"📋 **המעקב שלך**\n"
+    msg += f"🏨 {d.get('hotel_name', 'לא ידוע')}\n"
+    msg += f"💰 מחיר: ₪{d.get('best_price', 'N/A')}\n"
+    msg += f"📊 {len(d.get('history', []))} בדיקות"
+    
     await target.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     target = update.message or update.callback_query.message
+    
     if chat_id not in tracked_hotels:
         await target.reply_text("⚠️ אין נתונים", reply_markup=get_main_keyboard())
         return
+    
     history = tracked_hotels[chat_id].get('history', [])
     if not history:
         await target.reply_text("📊 אין נתונים לייצוא", reply_markup=get_main_keyboard())
         return
-    csv = "תאריך,מחיר,מבצע\n"
+    
+    csv = "תאריך,מחיר,מבצע,מחיר משתמש,חיסכון\n"
     for e in history:
         dt = e.get('date', datetime.now()).strftime('%Y-%m-%d %H:%M')
         p = e.get('price', '')
         s = 'כן' if e.get('sale') else 'לא'
-        csv += f"{dt},{p},{s}\n"
+        u_price = e.get('user_price', '')
+        savings = u_price - p if u_price and p else ''
+        csv += f"{dt},{p},{s},{u_price},{savings}\n"
+    
     await target.reply_text(
-        f"📤 **ייצוא נתונים**\n{csv[:500]}...",
+        f"📤 **ייצוא נתונים**\n\n{csv[:500]}...\n\n💡 {len(history)} רשומות",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
     )
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['state'] = None
     await update.message.reply_text("❌ בוטל", reply_markup=get_main_keyboard())
     return ConversationHandler.END
 
 # ==================== 7. לולאת בדיקות ====================
+
 async def check_prices_loop(app_telegram):
     while True:
         await asyncio.sleep(60)
         if not tracked_hotels:
             continue
+        
         print(f"🔄 בודק {len(tracked_hotels)} מלונות...")
+        
         for chat_id, data in list(tracked_hotels.items()):
             try:
-                # בנה URL עם פרמטרים
+                # בניית URL עם פרמטרים
                 url = data['url']
                 if data.get('check_in') and data.get('check_out'):
                     url += f"&checkin={data['check_in']}&checkout={data['check_out']}"
@@ -765,7 +1284,7 @@ async def check_prices_loop(app_telegram):
                 success, new_price, error, sale, info = await fetch_booking_price(url)
                 
                 if success and new_price:
-                    # עדכון פרטי המלון
+                    # עדכון פרטי מלון
                     if info.get('hotel_name'):
                         data['hotel_name'] = info['hotel_name']
                     if info.get('hotel_rating'):
@@ -787,24 +1306,34 @@ async def check_prices_loop(app_telegram):
                     data['history'].append({
                         'date': datetime.now(),
                         'price': new_price,
-                        'sale': sale
+                        'sale': sale,
+                        'user_price': data.get('user_price')
                     })
                     data['last_check'] = datetime.now()
-                    if info.get('sale_detected'):
-                        data['sale_detected'] = True
                     
-                    # בדיקת ירידת מחיר
-                    if new_price < data['target_price']:
-                        drop = ((data['target_price'] - new_price) / data['target_price']) * 100
-                        alert = f"🎉 **ירידת מחיר!** 📉\n💰 ₪{data['target_price']} → ₪{new_price}\n📉 {drop:.1f}%"
+                    # עדכון המחיר הכי זול
+                    if not data['best_price'] or new_price < data['best_price']:
+                        data['best_price'] = new_price
+                    
+                    # בדיקת ירידת מחיר לעומת המחיר שמצא המשתמש
+                    if data.get('user_price') and new_price < data['user_price']:
+                        savings = data['user_price'] - new_price
+                        percent = (savings / data['user_price']) * 100
+                        
+                        alert = f"🎉 **ירידת מחיר משמעותית!** 📉\n\n"
+                        alert += f"💰 **המחיר שמצאת:** ₪{data['user_price']}\n"
+                        alert += f"🔥 **מחיר עכשיו:** ₪{new_price}\n"
+                        alert += f"🎉 **חיסכון:** ₪{savings} ({percent:.1f}%)\n"
+                        
                         if sale:
-                            alert += "\n🔥 **מבצע פעיל!**"
+                            alert += "\n🔥 **מבצע פעיל!**\n"
                         if data.get('free_cancellation'):
-                            alert += "\n🔄 ביטול חינם ✅"
+                            alert += "\n🔄 ביטול חינם ✅\n"
                         if data.get('includes_breakfast'):
-                            alert += "\n🍳 ארוחת בוקר כלולה"
-                        alert += f"\n🔗 [להזמנה]({data['url']})"
-                        data['target_price'] = new_price
+                            alert += "\n🍳 ארוחת בוקר כלולה\n"
+                        
+                        alert += f"\n🔗 [לחץ להזמנה]({data['url']})"
+                        
                         await app_telegram.bot.send_message(
                             chat_id=chat_id,
                             text=alert,
@@ -812,12 +1341,31 @@ async def check_prices_loop(app_telegram):
                             reply_markup=get_main_keyboard(),
                             disable_web_page_preview=True
                         )
-                    elif data.get('alert_on_up') and new_price > data['target_price']:
-                        await app_telegram.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"📈 **עליית מחיר!**\n💰 ₪{data['target_price']} → ₪{new_price}",
-                            reply_markup=get_main_keyboard()
-                        )
+                        
+                        # עדכון המחיר שהמשתמש משווה
+                        data['user_price'] = new_price
+                    
+                    # בדיקת ירידה מול המחיר האחרון
+                    elif data['last_price'] and new_price < data['last_price']:
+                        drop = ((data['last_price'] - new_price) / data['last_price']) * 100
+                        if drop >= data.get('alert_threshold', 10):
+                            alert = f"📉 **ירידת מחיר!**\n"
+                            alert += f"💰 ₪{data['last_price']} → ₪{new_price}\n"
+                            alert += f"📉 {drop:.1f}% ירידה"
+                            if sale:
+                                alert += "\n🔥 מבצע!"
+                            alert += f"\n🔗 [להזמנה]({data['url']})"
+                            
+                            await app_telegram.bot.send_message(
+                                chat_id=chat_id,
+                                text=alert,
+                                parse_mode='Markdown',
+                                reply_markup=get_main_keyboard(),
+                                disable_web_page_preview=True
+                            )
+                    
+                    # עדכון מחיר אחרון
+                    data['last_price'] = new_price
                     
                     # התראת ביקוש גבוה
                     if data.get('viewers', 0) > 10:
@@ -838,7 +1386,7 @@ async def check_prices_loop(app_telegram):
                 else:
                     await app_telegram.bot.send_message(
                         chat_id=chat_id,
-                        text=f"⚠️ **שגיאה:** {error or 'לא ידוע'}",
+                        text=f"⚠️ **שגיאה בסריקה:**\n{error or 'לא ידוע'}",
                         reply_markup=get_main_keyboard()
                     )
             except Exception as e:
@@ -853,29 +1401,38 @@ async def check_prices_loop(app_telegram):
                     pass
 
 # ==================== 8. הפעלה ====================
+
 async def main():
     # Flask
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False), daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
-
+    
     # Telegram
     tg_app = Application.builder().token(TOKEN).build()
     await tg_app.bot.delete_webhook(drop_pending_updates=True)
-
+    
     # Handlers
     tg_app.add_handler(CommandHandler("start", start_command))
-    tg_app.add_handler(CommandHandler("track", track_command))
+    tg_app.add_handler(CommandHandler("test", test_command))
     tg_app.add_handler(CommandHandler("status", status_command))
     tg_app.add_handler(CommandHandler("stop", stop_command))
     tg_app.add_handler(CommandHandler("history", show_history))
     tg_app.add_handler(CommandHandler("list", list_tracking))
     tg_app.add_handler(CommandHandler("cancel", cancel_command))
-
+    
+    # Conversation handler
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_click, pattern="^btn_track$")],
+        entry_points=[
+            CallbackQueryHandler(button_click, pattern="^btn_track$"),
+            CallbackQueryHandler(button_click, pattern="^btn_test$")
+        ],
         states={
-            WAITING_FOR_DATA: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)],
-            WAITING_FOR_DATES: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)]
+            WAITING_FOR_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)],
+            WAITING_FOR_DATES: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)],
+            WAITING_FOR_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)],
+            WAITING_FOR_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)],
+            WAITING_FOR_FILTER: [CallbackQueryHandler(button_click), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message)],
+            WAITING_FOR_FILTER_CHANGE: [CallbackQueryHandler(button_click)]
         },
         fallbacks=[
             CommandHandler("cancel", cancel_command),
@@ -885,14 +1442,14 @@ async def main():
     tg_app.add_handler(conv)
     tg_app.add_handler(CallbackQueryHandler(button_click))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message))
-
+    
     # לולאה
     asyncio.create_task(check_prices_loop(tg_app))
-
-    print("🚀 Advanced Booking Bot v3.0 Started!")
+    
+    print("🚀 Advanced Booking Bot v4.0 Started!")
     print(f"🤖 Token: {TOKEN[:10]}...")
     print("🌐 Web: http://0.0.0.0:8080")
-
+    
     try:
         await tg_app.initialize()
         await tg_app.start()
