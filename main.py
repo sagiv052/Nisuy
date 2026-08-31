@@ -8,23 +8,24 @@ from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationLogic
+    MessageHandler, filters, ContextTypes, ConversationHandler
 )
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async  # 🥷 תוסף ההסוואה החדש!
 
 # --- 1. הגדרות ושרת Keep-Alive ---
 TOKEN = "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU"
-RENDER_URL = "https://booking-bot-nisuy.onrender.com"  # הקישור המעודכן לשרת הניסוי ב-Render
+RENDER_URL = "https://booking-bot-nisuy.onrender.com"  
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Booking Bot Test Mode Active! 🤖"
+    return "Booking Bot Test Mode Active & Stealthy! 🤖🥷"
 
 def keep_alive():
     while True:
-        time.sleep(600)  # פינג כל 10 דקות
+        time.sleep(600)  
         try:
             requests.get(RENDER_URL)
             print("Ping sent successfully! 🚀")
@@ -52,7 +53,8 @@ async def fetch_booking_price(url: str):
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-web-security'
+                '--disable-web-security',
+                '--window-size=1920,1080'
             ]
         )
         
@@ -63,30 +65,30 @@ async def fetch_booking_price(url: str):
             timezone_id="Asia/Jerusalem",
             extra_http_headers={
                 'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Referer': 'https://www.google.com/',  # 🌐 זיוף הגעה דרך גוגל
                 'Sec-Ch-Ua-Mobile': '?1' if is_mobile else '?0',
                 'Sec-Fetch-Dest': 'document',
                 'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none'
+                'Sec-Fetch-Site': 'cross-site'
             }
         )
         
         page = await context.new_page()
 
-        # שכבת הגנה נוספת: חסימת תמונות ופונטים להאצת הסריקה וחיסכון ב-RAM
-        await page.route("**/*.{png,jpg,jpeg,gif,webp,ttf,woff,woff2}", lambda route: route.abort())
+        # 🥷 הפעלת מצב Stealth מתקדם
+        await stealth_async(page)
 
-        # הסוואת זיהוי ה-Automation של Chromium
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-        """)
+        # חסימת מדיה להאצה
+        await page.route("**/*.{png,jpg,jpeg,gif,webp,ttf,woff,woff2,css}", lambda route: route.abort())
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(random.randint(2000, 4000))
+            await page.wait_for_timeout(random.randint(2500, 5000))
             
-            # הדמיית התנהגות אנושית: הזזת עכבר אקראית
+            # 🖱️ הדמיית התנהגות אנושית: תזוזת עכבר וגלילה
             await page.mouse.move(random.randint(100, 500), random.randint(100, 500))
+            await page.mouse.wheel(0, random.randint(300, 800))  # גלילה מטה
+            await page.wait_for_timeout(random.randint(1000, 2000))
 
             price_element = await page.query_selector('.prco-val-bignum, .bd-price-value, [data-testid="price-and-discounted-price"]')
             if price_element:
@@ -96,35 +98,31 @@ async def fetch_booking_price(url: str):
                 return True, clean_price, None
             else:
                 await browser.close()
-                return False, None, "לא נמצא אלמנט מחיר בדף (ייתכן שהקישור שגוי או שהופעלה הגנת Captcha)"
+                return False, None, "לא נמצא מחיר (ייתכן שבוקינג ביקש קאפצ'ה או שהקישור שגוי)"
         except Exception as e:
             await browser.close()
             return False, None, str(e)
 
 # --- 3. ממשק טלגרם דינמי ומערכת הבדיקה ---
-tracked_hotels = {}  # {chat_id: {'url': url, 'target_price': target}}
+tracked_hotels = {}
 WAITING_FOR_DATA = 1
 
 def get_main_keyboard():
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ התחל מעקב חדש", callback_data="btn_track")],
         [InlineKeyboardButton("📊 מצב מעקב נוכחי", callback_data="btn_status")],
         [InlineKeyboardButton("🛑 עצור מעקב", callback_data="btn_stop")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "אהלן! 🤖🏨 מוד ניסוי פעיל (בדיקה כל 1 דקה).\n\n"
-        "תוכל להשתמש בכפתורים למטה או בפקודות הישירות:\n"
+        "אהלן! 🤖🏨 הבוט החשאי מוכן (בדיקה כל דקה).\n\n"
         "• `/track <URL> <מחיר>` - להתחלת מעקב\n"
-        "• `/status` - לבדיקת מצב המעקב\n"
-        "• `/stop` - להפסקת המעקב"
+        "• `/status` - לבדיקת מצב\n"
+        "• `/stop` - לעצירה"
     )
-    if update.message:
-        await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
+    target = update.message or update.callback_query.message
+    await target.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode='Markdown')
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -132,9 +130,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "btn_track":
         await query.message.reply_text(
-            "שלח כעת את הקישור לבוקינג יחד עם המחיר הנוכחי בפורמט הזה:\n\n"
-            "`<קישור> <מחיר>`\n\n"
-            "דוגמה:\n`https://booking.com/... 1200`",
+            "שלח כעת את הקישור יחד עם המחיר הנוכחי:\n\n`<קישור> <מחיר>`",
             parse_mode='Markdown'
         )
         return WAITING_FOR_DATA
@@ -149,99 +145,68 @@ async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYP
         url = text_parts[0]
         try:
             price = int(text_parts[1])
-            chat_id = update.effective_chat.id
-            tracked_hotels[chat_id] = {'url': url, 'target_price': price}
+            tracked_hotels[update.effective_chat.id] = {'url': url, 'target_price': price}
             await update.message.reply_text(
-                f"✅ **המעקב הוגדר בהצלחה!**\n\n"
-                f"🔗 **URL:** {url[:35]}...\n"
-                f"💰 **מחיר יעד:** ₪{price}\n\n"
-                f"⏱️ **מצב ניסוי:** הבוט ייסרוק עכשיו את האתר **כל 1 דקה** וידווח תוצאה!",
-                reply_markup=get_main_keyboard(),
-                parse_mode='Markdown'
+                f"✅ **המעקב הוגדר בהצלחה!**\n💰 **מחיר יעד:** ₪{price}\n⏱️ **בדיקה תתבצע כל 1 דקה.**",
+                reply_markup=get_main_keyboard(), parse_mode='Markdown'
             )
-            return ConversationLogic.END
+            return ConversationHandler.END
         except ValueError:
-            await update.message.reply_text("❌ המחיר חייב להיות במספר בלבד! נסה שוב.", reply_markup=get_main_keyboard())
+            await update.message.reply_text("❌ המחיר חייב להיות מספר! נסה שוב.", reply_markup=get_main_keyboard())
     else:
-        await update.message.reply_text("❌ פורמט לא תקין. שלח: `<קישור> <מחיר>`", reply_markup=get_main_keyboard(), parse_mode='Markdown')
+        await update.message.reply_text("❌ פורמט לא תקין. שלח: `<קישור> <מחיר>`", reply_markup=get_main_keyboard())
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        url = context.args[0]
-        price = int(context.args[1])
-        chat_id = update.effective_chat.id
-        tracked_hotels[chat_id] = {'url': url, 'target_price': price}
-        await update.message.reply_text(
-            f"✅ **המעקב הוגדר בהצלחה (דרך פקודה)!**\n\n"
-            f"💰 **מחיר יעד:** ₪{price}\n"
-            f"⏱️ **בדיקה תתבצע כל 1 דקה.**",
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
-        )
+        url, price = context.args[0], int(context.args[1])
+        tracked_hotels[update.effective_chat.id] = {'url': url, 'target_price': price}
+        await update.message.reply_text(f"✅ **מעקב הוגדר!** יעד: ₪{price}", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ פורמט לא תקין. שלח: `/track <קישור> <מחיר>`", parse_mode='Markdown')
+        await update.message.reply_text("❌ פורמט לא תקין: `/track <קישור> <מחיר>`")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    target = update.message if update.message else update.callback_query.message
+    target = update.message or update.callback_query.message
     if chat_id in tracked_hotels:
         data = tracked_hotels[chat_id]
         await target.reply_text(
-            f"📊 **מצב מעקב פעיל:**\n\n"
-            f"💰 **מחיר יעד מוגדר:** ₪{data['target_price']}\n"
-            f"🔗 **קישור:** [לחץ מעבר]({data['url']})\n"
-            f"⏱️ **תדירות בדיקה:** כל דקה אחת.",
-            reply_markup=get_main_keyboard(),
-            parse_mode='Markdown'
+            f"📊 **מצב מעקב:** פעיל\n💰 **יעד:** ₪{data['target_price']}\n🔗 [קישור למלון]({data['url']})",
+            reply_markup=get_main_keyboard(), parse_mode='Markdown', disable_web_page_preview=True
         )
     else:
-        await target.reply_text("ℹ️ אין כרגע מעקב פעיל. לחץ על 'התחל מעקב חדש' כדי להגדיר!", reply_markup=get_main_keyboard())
+        await target.reply_text("ℹ️ אין מעקב פעיל כרגע.", reply_markup=get_main_keyboard())
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    target = update.message if update.message else update.callback_query.message
-    if chat_id in tracked_hotels:
-        del tracked_hotels[chat_id]
+    target = update.message or update.callback_query.message
+    if tracked_hotels.pop(chat_id, None):
         await target.reply_text("🛑 המעקב הופסק בהצלחה!", reply_markup=get_main_keyboard())
     else:
-        await target.reply_text("ℹ️ אין מעקב פעיל להפסיק.", reply_markup=get_main_keyboard())
+        await target.reply_text("ℹ️ אין מעקב פעיל.", reply_markup=get_main_keyboard())
 
-# --- 4. לולאת בדיקת מחירים בלייב (כל 1 דקה לניסוי) ---
+# --- 4. לולאת בדיקת מחירים בלייב ---
 async def test_check_prices_loop(app_telegram):
     while True:
-        await asyncio.sleep(60)  # ניסוי: בדיקה כל 60 שניות (1 דקה)
+        await asyncio.sleep(60)  
         for chat_id, data in list(tracked_hotels.items()):
             success, new_price, error_msg = await fetch_booking_price(data['url'])
             
             if success:
                 if new_price < data['target_price']:
-                    msg = (
-                        f"🎉 **יש שינוי - עבר בהצלחה!** 📉\n\n"
-                        f"💰 **מחיר נוכחי (שלך):** ₪{data['target_price']}\n"
-                        f"🔥 **מחיר חדש שנמצא:** ₪{new_price}\n\n"
-                        f"🔗 [לחץ כאן למעבר להזמנה]({data['url']})"
-                    )
-                    data['target_price'] = new_price  # עדכון המחיר היעד
+                    msg = f"🎉 **יש ירידת מחיר!** 📉\n\n💰 **מחיר קודם:** ₪{data['target_price']}\n🔥 **חדש:** ₪{new_price}\n🔗 [לחץ להזמנה]({data['url']})"
+                    data['target_price'] = new_price 
                 else:
-                    msg = (
-                        f"ℹ️ **אין שינוי - עבר בהצלחה!** ✅\n\n"
-                        f"💰 **מחיר שהוגדר:** ₪{data['target_price']}\n"
-                        f"🔍 **מחיר שניסרק עכשיו:** ₪{new_price}"
-                    )
+                    msg = f"ℹ️ **הסריקה עברה!** ✅\n💰 **יעד שלך:** ₪{data['target_price']}\n🔍 **מחיר שמצאתי עכשיו:** ₪{new_price}"
             else:
-                msg = f"⚠️ **ERROR בדיקת המחיר נכשלה!**\n\n**סיבה:** `{error_msg}`"
+                msg = f"⚠️ **שגיאה בסריקה!**\n`{error_msg}`"
 
-            await app_telegram.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown', reply_markup=get_main_keyboard())
+            await app_telegram.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown', reply_markup=get_main_keyboard(), disable_web_page_preview=True)
 
-# --- 5. הפעלת השרת והבוט באופן מתואם ---
+# --- 5. הפעלת השרת והבוט ---
 async def main():
-    # הפעלת Flask בשרשור נפרד
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
-    
-    # הפעלת Pinger
     threading.Thread(target=keep_alive, daemon=True).start()
 
-    # אתחול אפליקציית הטלגרם
     tg_app = Application.builder().token(TOKEN).build()
     
     tg_app.add_handler(CommandHandler("start", start_command))
@@ -251,16 +216,12 @@ async def main():
     tg_app.add_handler(CallbackQueryHandler(button_click))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message))
 
-    # הפעלת לולאת המעקב ברקע
     asyncio.create_task(test_check_prices_loop(tg_app))
+    print("Stealth Bot Started! 🚀🥷")
 
-    print("Test Bot Started Successfully! 🚀")
-
-    # הרצת הבוט בצורה אסינכרונית יציבה
     async with tg_app:
         await tg_app.start()
         await tg_app.updater.start_polling()
-        # שמירה על השרת פעיל
         await asyncio.Event().wait()
 
 if __name__ == '__main__':
