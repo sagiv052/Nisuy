@@ -14,7 +14,7 @@ from playwright.async_api import async_playwright
 
 # --- 1. הגדרות ושרת Keep-Alive ---
 TOKEN = "8155459616:AAFPWhdETkxBtEiaKZ-fJU--O2NHwJ3BYvU"
-RENDER_URL = "https://booking-bot-nisuy.onrender.com"  # עדכן את ה-URL של Render במידת הצורך
+RENDER_URL = "https://booking-bot-nisuy.onrender.com"  # הקישור המעודכן לשרת הניסוי ב-Render
 
 app = Flask(__name__)
 
