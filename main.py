@@ -200,18 +200,35 @@ async def fetch_booking_price(url: str):
     headers = get_random_headers(platform)
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-site-isolation-trials'
-            ]
-        )
+        # 🔥 תיקון - הוספת נתיב מדויק לדפדפן
+        try:
+            browser = await p.chromium.launch(
+                headless=True,
+                executable_path='/opt/render/.cache/ms-playwright/chromium-1155/chrome-linux/chrome',
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials'
+                ]
+            )
+        except:
+            # אם הנתיב לא עובד - נסה בלי נתיב
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials'
+                ]
+            )
         
         context = await browser.new_context(
             user_agent=ua,
@@ -381,6 +398,10 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if query.data == "btn_track":
+        # איפוס state
+        context.user_data['state'] = None
+        context.user_data['temp_dates'] = None
+        
         if chat_id in tracked_hotels:
             await query.message.reply_text(
                 "⚠️ כבר יש לך מעקב פעיל!\n"
@@ -412,9 +433,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`https://www.booking.com/hotel/il/x`",
             parse_mode='Markdown'
         )
+        context.user_data['state'] = WAITING_FOR_URL
         return WAITING_FOR_URL
 
     elif query.data == "btn_test":
+        context.user_data['state'] = None
         await query.message.reply_text(
             "🧪 **שלח קישור לבדיקה**\n\n"
             "הבוט יסרוק את המלון ויציג את כל הנתונים\n"
@@ -423,6 +446,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "`https://www.booking.com/Share-ALqQ48w`",
             parse_mode='Markdown'
         )
+        context.user_data['state'] = WAITING_FOR_URL
         return WAITING_FOR_URL
 
     elif query.data == "btn_status":
@@ -503,9 +527,11 @@ async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if 'booking.com' not in url.lower():
             await update.message.reply_text(
                 "❌ **קישור לא תקין**\n\n"
-                "שלח קישור מ-Booking.com בלבד.",
+                "שלח קישור מ-Booking.com בלבד.\n"
+                "למשל: `https://www.booking.com/Share-ALqQ48w`",
                 parse_mode='Markdown'
             )
+            context.user_data['state'] = WAITING_FOR_URL
             return WAITING_FOR_URL
         
         if chat_id not in tracked_hotels:
@@ -526,7 +552,22 @@ async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYP
         tracked_hotels[chat_id]['url'] = url
         
         await update.message.reply_text("🔍 **בודק קישור...**")
-        success, price, error, sale, info = await fetch_booking_price(url)
+        
+        try:
+            # הוספת Timeout של 30 שניות
+            success, price, error, sale, info = await asyncio.wait_for(
+                fetch_booking_price(url),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                "⏰ **הסריקה ארכה יותר מדי זמן**\n\n"
+                "יכול להיות שהאתר עמוס או שיש בעיה.\n"
+                "נסה שוב בעוד כמה דקות.",
+                reply_markup=get_main_keyboard()
+            )
+            context.user_data['state'] = None
+            return ConversationHandler.END
         
         if success and price:
             tracked_hotels[chat_id]['hotel_name'] = info.get('hotel_name', 'מלון')
@@ -643,10 +684,21 @@ async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYP
             if chat_id in tracked_hotels:
                 data = tracked_hotels[chat_id]
                 
-                # ביצוע סריקה ראשונית
                 await update.message.reply_text("🔍 **מבצע סריקה ראשונית...**")
                 
-                success, price, error, sale, info = await fetch_booking_price(data['url'])
+                try:
+                    success, price, error, sale, info = await asyncio.wait_for(
+                        fetch_booking_price(data['url']),
+                        timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    await update.message.reply_text(
+                        "⏰ **הסריקה ארכה יותר מדי זמן**\n\n"
+                        "נסה שוב בעוד כמה דקות.",
+                        reply_markup=get_main_keyboard()
+                    )
+                    context.user_data['state'] = None
+                    return ConversationHandler.END
                 
                 if success and price:
                     data['last_price'] = price
@@ -693,7 +745,19 @@ async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     
                     await update.message.reply_text("🔍 **מבצע סריקה ראשונית...**")
                     
-                    success, new_price, error, sale, info = await fetch_booking_price(data['url'])
+                    try:
+                        success, new_price, error, sale, info = await asyncio.wait_for(
+                            fetch_booking_price(data['url']),
+                            timeout=30.0
+                        )
+                    except asyncio.TimeoutError:
+                        await update.message.reply_text(
+                            "⏰ **הסריקה ארכה יותר מדי זמן**\n\n"
+                            "נסה שוב בעוד כמה דקות.",
+                            reply_markup=get_main_keyboard()
+                        )
+                        context.user_data['state'] = None
+                        return ConversationHandler.END
                     
                     if success and new_price:
                         data['last_price'] = new_price
@@ -768,7 +832,18 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.args[0]
     msg = await update.message.reply_text("⏳ **בודק...** זה יכול לקחת 10-20 שניות")
     
-    success, price, error, sale, info = await fetch_booking_price(url)
+    try:
+        success, price, error, sale, info = await asyncio.wait_for(
+            fetch_booking_price(url),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        await msg.edit_text(
+            "⏰ **הסריקה ארכה יותר מדי זמן**\n\n"
+            "נסה שוב בעוד כמה דקות.",
+            reply_markup=get_main_keyboard()
+        )
+        return
     
     if success:
         result = (
