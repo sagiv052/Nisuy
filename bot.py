@@ -45,7 +45,7 @@ def load_rules(path: Path) -> list[Rule]:
     rules: list[Rule] = []
     for row in reader:
         message = (row.get("received_message") or "").strip()
-        reply = row.get("reply_message") or ""
+        reply = (row.get("reply_message") or "").replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
         if not message or not reply:
             continue
         rules.append(
