@@ -1,0 +1,1814 @@
+"""
+Telegram Stream-on-Demand Server
+ארכיטקטורה מפושטת: בוט אחד, מחובר ב-MTProto (לא Bot API HTTP), שמזרים
+ישירות מהצ'אט המקורי שבו הוא קיבל את הקובץ. אין userbot, אין
+SESSION_STRING, אין copy/forward ל-Saved Messages.
+
+למה זה עובד בלי מגבלת 20MB?
+ה-20MB הוא מגבלה של שכבת ה-HTTP Bot API (api.telegram.org/bot.../getFile)
+בלבד. Pyrogram מדבר ישירות עם שרתי MTProto של טלגרם — אותו פרוטוקול
+שאפליקציית טלגרם הרגילה משתמשת בו — ולכן לא כפוף למגבלה הזו. בוט
+שמחובר עם bot_token דרך Pyrogram יכול להוריד/להזרים קבצים גדולים בלי
+שום תחבולה.
+
+זה מבטל לגמרי את הבאג "'NoneType' object has no attribute 'id'" כי
+אין יותר שום קופי/פורוורד — המסר נשלף ישירות מהמיקום המקורי שלו.
+"""
+
+import os
+import re
+import sys
+import time
+import asyncio
+import hashlib
+import json
+import logging
+import httpx
+from pathlib import Path
+from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, cast
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from pyrogram import filters
+from pyrogram.client import Client
+from pyrogram.types import Message, ReplyKeyboardMarkup
+from pyrogram.errors import FloodWait
+import uvicorn
+
+from catalog import Catalog
+from memory_cache import ChunkMemoryCache
+from tmdb import TMDBClient
+from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
+
+load_dotenv()
+
+# ── בדיקת משתני סביבה ──────────────────────────────────────────────────────
+# SESSION_STRING, API_ID ו-API_HASH לא נדרשים מהמשתמש.
+# הערכים האופציונליים מאפשרים להחליף את פרטי האפליקציה בלי לשנות קוד.
+DEFAULT_API_ID = 6
+DEFAULT_API_HASH = "eb06d4abfb49dc3e"
+REQUIRED_ENV_VARS = ["BOT_TOKEN"]
+_missing = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+if _missing:
+    sys.exit(
+        f"❌ חסרים משתני סביבה: {', '.join(_missing)}\n"
+        f"   הגדר אותם ב-Render → Environment ונסה שוב."
+    )
+
+API_ID    = int(os.environ.get("API_ID", DEFAULT_API_ID))
+API_HASH  = os.environ.get("API_HASH", DEFAULT_API_HASH)
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+PORT      = int(os.environ.get("PORT", 8000))
+KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
+LEAVE_UNAPPROVED_CHATS = os.environ.get("LEAVE_UNAPPROVED_CHATS", "1").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+# Render מגדיר את זה אוטומטית לכתובת הציבורית האמיתית של השירות.
+BASE_URL = (
+    os.environ.get("BASE_URL")
+    or os.environ.get("RENDER_EXTERNAL_URL")
+    or f"http://localhost:{PORT}"
+).rstrip("/")
+
+stats: dict[str, Any] = {
+    "started_at": datetime.now(timezone.utc).isoformat(),
+    "files_processed": 0,
+    "links_generated": 0,
+    "last_file": None,
+    "last_ping": None,
+}
+
+def _catalog_database_path() -> str:
+    configured_path = Path(os.environ.get("CATALOG_DB", "catalog.db"))
+    try:
+        configured_path.parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(configured_path.parent, os.W_OK):
+            raise PermissionError(f"Directory is not writable: {configured_path.parent}")
+        return str(configured_path)
+    except OSError as error:
+        fallback_path = Path("/tmp/catalog.db")
+        log.warning("Catalog path %s is unavailable (%s); using %s", configured_path, error, fallback_path)
+        return str(fallback_path)
+
+
+CATALOG = Catalog(_catalog_database_path())
+TMDB = TMDBClient(
+    os.environ.get("TMDB_READ_ACCESS_TOKEN", ""),
+    os.environ.get("TMDB_API_KEY", ""),
+)
+OWNER_USER_ID = 5699704187
+CONFIGURED_ADMIN_USER_IDS = {
+    int(value.strip())
+    for value in os.environ.get("ADMIN_USER_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+for admin_id in CONFIGURED_ADMIN_USER_IDS:
+    CATALOG.add_admin(admin_id)
+    CATALOG.add_user(admin_id, OWNER_USER_ID)
+CATALOG.add_admin(OWNER_USER_ID)
+CATALOG.add_user(OWNER_USER_ID, OWNER_USER_ID)
+ADMIN_USER_IDS = set(CATALOG.list_admins()) | {OWNER_USER_ID}
+user_states: dict[int, dict[str, Any]] = {}
+MESSAGE_CACHE_TTL = 60.0
+message_cache: dict[tuple[int, int], tuple[float, Message]] = {}
+message_cache_lock = asyncio.Lock()
+MAX_ACTIVE_STREAMS = min(3, max(1, int(os.environ.get("MAX_ACTIVE_STREAMS", "2"))))
+stream_slots = asyncio.Semaphore(MAX_ACTIVE_STREAMS)
+active_streams = 0
+STREAM_CACHE_MB = min(64, max(16, int(os.environ.get("STREAM_CACHE_MB", "32"))))
+STREAM_CACHE_TTL = max(30, int(os.environ.get("STREAM_CACHE_TTL", "90")))
+STREAM_READ_AHEAD = max(0, min(1, int(os.environ.get("STREAM_READ_AHEAD", "0"))))
+chunk_cache = ChunkMemoryCache(STREAM_CACHE_MB * 1024 * 1024, STREAM_CACHE_TTL)
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🎬 סרטים", "📺 סדרות"],
+        ["📚 רשימה", "🔗 קישור סטרימינג"],
+        ["📊 דוח", "📖 מדריך", "ℹ️ אודות"],
+        ["🛠️ ניהול"],
+        ["❌ ביטול"],
+    ],
+    resize_keyboard=True,
+)
+MOVIES_KEYBOARD = ReplyKeyboardMarkup(
+    [["➕ הוסף סרט", "✏️ ערוך סרט"], ["🗑️ הסר סרט"], ["⬅️ חזרה"]],
+    resize_keyboard=True,
+)
+SERIES_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["➕ הוסף סדרה", "✏️ ערוך סדרה"],
+        ["🗑️ הסר סדרה", "➕ הוסף פרק"],
+        ["🗑️ הסר עונה", "🗑️ הסר פרק"],
+        ["⬅️ חזרה"],
+    ],
+    resize_keyboard=True,
+)
+UPLOAD_SEASON_KEYBOARD = ReplyKeyboardMarkup(
+    [["✅ סיום"], ["🔄 רענן", "❌ ביטול"]],
+    resize_keyboard=True,
+)
+OPTIONAL_FIELD_KEYBOARD = ReplyKeyboardMarkup(
+    [["⏭️ דלג"], ["❌ ביטול"]],
+    resize_keyboard=True,
+)
+EDIT_FIELD_KEYBOARD = ReplyKeyboardMarkup(
+    [["✏️ שם", "📝 תקציר"], ["📅 שנת יציאה", "🖼️ פוסטר"], ["❌ ביטול"]],
+    resize_keyboard=True,
+)
+MANAGEMENT_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["➕ הוסף מנהל", "➖ הסר מנהל"],
+        ["✅ אשר משתמש", "🗑️ הסר משתמש"],
+        ["✅ אשר קבוצה", "✅ אשר ערוץ"],
+        ["🗑️ הסר צ׳אט", "📋 רשימות ניהול"],
+        ["⬅️ חזרה"],
+    ],
+    resize_keyboard=True,
+)
+SKIP_WORDS = {"-", "דלג", "skip", "סבבה", "ok", "okay"}
+
+# בוט אחד בלבד, מחובר ב-MTProto (לא Bot API HTTP) — גם מקבל הודעות וגם מזרים מהן.
+bot_client = Client(
+    name="stream_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True,
+)
+
+
+@bot_client.on_message(filters.group | filters.channel, group=-1)  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
+async def enforce_chat_allowlist(client: Client, message: Message) -> None:
+    if not await reject_unauthorized(message):
+        return
+    chat_id = int(getattr(message.chat, "id", 0) or 0)
+    if chat_id:
+        if not LEAVE_UNAPPROVED_CHATS:
+            return
+        try:
+            await client.leave_chat(chat_id)
+            log.info("Left unapproved chat %s", chat_id)
+        except Exception as error:
+            log.warning("Could not leave unapproved chat %s: %s", chat_id, error)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+    await bot_client.start()
+    keep_alive_task = asyncio.create_task(keep_alive())
+    log.info("All systems ready ✅ BASE_URL=%s", BASE_URL)
+    try:
+        yield
+    finally:
+        keep_alive_task.cancel()
+        await send_heartbeat("shutdown")
+        await bot_client.stop()
+
+
+api = FastAPI(title="Telegram Stream Server", lifespan=lifespan)
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+# ── Stream helpers ────────────────────────────────────────────────────────────
+
+async def fetch_message(chat_id: int, message_id: int) -> Message:
+    cache_key = (chat_id, message_id)
+    async with message_cache_lock:
+        cached = message_cache.get(cache_key)
+        if cached and time.monotonic() - cached[0] < MESSAGE_CACHE_TTL:
+            return cached[1]
+    for _ in range(5):
+        try:
+            msg = await bot_client.get_messages(chat_id, message_id)
+            if isinstance(msg, list):
+                raise HTTPException(status_code=404, detail="Message not found")
+            async with message_cache_lock:
+                message_cache[cache_key] = (time.monotonic(), msg)
+            return msg
+        except FloodWait as e:
+            delay = e.value if isinstance(e.value, (int, float)) else 1.0
+            log.warning("FloodWait %ss", delay)
+            await asyncio.sleep(float(delay))
+    raise HTTPException(status_code=429, detail="Rate limit")
+
+
+PYROGRAM_CHUNK_SIZE = 1024 * 1024  # Pyrogram's chunk size is fixed at 1 MiB — not configurable
+
+
+async def stream_chunks(
+    msg: Message,
+    start: int = 0,
+    end: Optional[int] = None,
+    file_size: Optional[int] = None,
+) -> AsyncGenerator[bytes, None]:
+    global active_streams
+    if not msg or not msg.media:
+        raise HTTPException(status_code=404, detail="No media in message")
+
+    media = msg.audio or msg.video or msg.document or msg.video_note
+    if not media:
+        raise HTTPException(status_code=415, detail="Unsupported media type")
+
+    first_chunk = start // PYROGRAM_CHUNK_SIZE
+    skip = start % PYROGRAM_CHUNK_SIZE
+    last_chunk = end // PYROGRAM_CHUNK_SIZE if end is not None else (
+        (file_size - 1) // PYROGRAM_CHUNK_SIZE if file_size else None
+    )
+    to_send = (end - start + 1) if end is not None else None
+    sent = 0
+    prefetch_task: Optional[asyncio.Task[bytes]] = None
+
+    async def load_chunk(chunk_index: int) -> bytes:
+        chunks = cast(AsyncIterator[bytes], bot_client.stream_media(msg, offset=chunk_index, limit=1))
+        parts: list[bytes] = []
+        async for part in chunks:
+            parts.append(part)
+        return b"".join(parts)
+
+    try:
+        await asyncio.wait_for(stream_slots.acquire(), timeout=10.0)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=503, detail="Too many active streams") from exc
+    active_streams += 1
+    try:
+        chunk_index = first_chunk
+        while last_chunk is None or chunk_index <= last_chunk:
+            if prefetch_task is not None:
+                chunk = await prefetch_task
+                prefetch_task = None
+            else:
+                chunk = await chunk_cache.get_or_load(
+                    (int(msg.chat.id), int(msg.id), chunk_index),
+                    lambda index=chunk_index: load_chunk(index),
+                )
+            if not chunk:
+                break
+            if skip > 0:
+                if skip >= len(chunk):
+                    skip -= len(chunk)
+                    chunk_index += 1
+                    continue
+                chunk = chunk[skip:]
+                skip = 0
+
+            if to_send is not None:
+                remaining = to_send - sent
+                if remaining <= 0:
+                    break
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+
+            yield chunk
+            sent += len(chunk)
+            if to_send is not None and sent >= to_send:
+                break
+            if last_chunk is None and len(chunk) < PYROGRAM_CHUNK_SIZE:
+                break
+            next_chunk = chunk_index + 1
+            if STREAM_READ_AHEAD and (last_chunk is None or next_chunk <= last_chunk):
+                prefetch_task = asyncio.create_task(
+                    chunk_cache.get_or_load(
+                        (int(msg.chat.id), int(msg.id), next_chunk),
+                        lambda index=next_chunk: load_chunk(index),
+                    )
+                )
+            chunk_index += 1
+    except asyncio.CancelledError:
+        log.info("Stream cancelled after %s bytes", sent)
+        raise
+    finally:
+        if prefetch_task is not None:
+            if not prefetch_task.done():
+                prefetch_task.cancel()
+            else:
+                prefetch_task.exception()
+        active_streams -= 1
+        stream_slots.release()
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@api.get("/stream/{chat_id}/{message_id}")
+async def stream(chat_id: int, message_id: int, request: Request):
+    msg = await fetch_message(chat_id, message_id)
+    if not msg or not msg.media:
+        raise HTTPException(status_code=404, detail="No media found")
+
+    media     = msg.audio or msg.video or msg.document or msg.video_note
+    if not media:
+        raise HTTPException(status_code=415, detail="Unsupported media type")
+
+    file_size = int(getattr(media, "file_size", 0) or 0)
+    if file_size <= 0:
+        raise HTTPException(status_code=503, detail="File size is unavailable")
+    mime_type = getattr(media, "mime_type", "application/octet-stream")
+    file_name = getattr(media, "file_name", f"file_{message_id}")
+
+    range_header = request.headers.get("Range")
+    if range_header:
+        try:
+            start, end = parse_range(range_header, file_size)
+        except RangeNotSatisfiable as exc:
+            raise HTTPException(
+                status_code=416,
+                detail="Range Not Satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            ) from exc
+        headers = {
+            "Content-Range":       f"bytes {start}-{end}/{file_size}",
+            "Accept-Ranges":       "bytes",
+            "Content-Length":      str(end - start + 1),
+            "Content-Disposition": content_disposition_filename(file_name),
+            "Cache-Control": "no-store",
+        }
+        return StreamingResponse(
+            stream_chunks(msg, start, end, file_size),
+            status_code=206, media_type=mime_type, headers=headers,
+        )
+
+    headers = {
+        "Accept-Ranges":       "bytes",
+        "Content-Length":      str(file_size),
+        "Content-Disposition": content_disposition_filename(file_name),
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(
+        stream_chunks(msg, file_size=file_size),
+        status_code=200, media_type=mime_type, headers=headers,
+    )
+
+
+@api.get("/api/v1/playback/{chat_id}/{message_id}")
+async def playback_info(chat_id: int, message_id: int, mode: str = "auto"):
+    """Return the lightweight direct Range stream without server-side downloads."""
+    if mode not in {"auto", "direct"}:
+        raise HTTPException(status_code=400, detail="mode must be auto or direct on this hosting plan")
+    msg = await fetch_message(chat_id, message_id)
+    if not msg or not msg.media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    media = msg.audio or msg.video or msg.document or msg.video_note
+    if not media:
+        raise HTTPException(status_code=415, detail="Unsupported media type")
+    file_size = int(getattr(media, "file_size", 0) or 0)
+    mime_type = getattr(media, "mime_type", "application/octet-stream")
+    direct_url = f"{BASE_URL}/stream/{chat_id}/{message_id}"
+    payload: dict[str, Any] = {
+        "api_version": 1,
+        "source": {"chat_id": chat_id, "message_id": message_id, "size": file_size, "mime_type": mime_type},
+        "direct": {"url": direct_url, "supports_range": True, "supports_seek": True},
+        "selected": {"mode": "direct", "url": direct_url},
+    }
+    return JSONResponse(payload)
+
+
+@api.get("/ping")
+async def ping():
+    stats["last_ping"] = datetime.now(timezone.utc).isoformat()
+    return JSONResponse({"status": "ok", "active_streams": active_streams, "cache": await chunk_cache.stats()})
+
+
+@api.get("/health")
+async def health():
+    """Dependency-aware health endpoint for monitoring and deployment checks."""
+    database_ok = True
+    database_error = None
+    try:
+        CATALOG.summary()
+    except Exception as error:
+        database_ok = False
+        database_error = type(error).__name__
+    bot_ok = bool(getattr(bot_client, "is_connected", False))
+    status = "ok" if database_ok and bot_ok else "degraded"
+    return JSONResponse(
+        {
+            "status": status,
+            "database": "ok" if database_ok else "error",
+            "database_error": database_error,
+            "telegram": "connected" if bot_ok else "starting",
+            "active_streams": active_streams,
+            "stream_capacity": MAX_ACTIVE_STREAMS,
+            "cache": await chunk_cache.stats(),
+        },
+        status_code=200 if database_ok else 503,
+    )
+
+
+@api.get("/api/catalog")
+async def catalog_api():
+    return JSONResponse({
+        "items": CATALOG.list_items(),
+        "summary": CATALOG.summary(),
+    })
+
+
+@api.get("/api/catalog/{item_id}")
+async def catalog_item_api(item_id: int):
+    item = CATALOG.get_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Catalog item not found")
+    if item["kind"] == "series":
+        item["seasons"] = CATALOG.list_seasons(item_id)
+        item["episodes"] = CATALOG.list_episodes(item_id)
+    return JSONResponse(item)
+
+
+@api.get("/api/uploads")
+async def uploads_api():
+    return JSONResponse({"uploads": CATALOG.list_uploads()})
+
+
+# ── Versioned API for the Android catalogue app ─────────────────────────────
+
+def _public_item(item: dict[str, Any], include_stream: bool = False) -> dict[str, Any]:
+    """Return a stable app-facing representation without Telegram internals."""
+    allowed = {
+        "id", "kind", "title", "summary", "release_year", "poster_url",
+        "backdrop_url", "quality", "genre", "rating", "tmdb_id", "created_at", "updated_at",
+    }
+    result = {key: item.get(key) for key in allowed if key in item}
+    if include_stream:
+        result["stream_url"] = item.get("stream_url", "")
+    return result
+
+
+def _etag(payload: Any) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+@api.get("/api/v1/catalog")
+async def catalog_v1(kind: Optional[str] = None, q: str = "", page: int = 1, limit: int = 50):
+    """Paginated catalogue endpoint intended for the Android app."""
+    if kind not in {None, "movie", "series"}:
+        raise HTTPException(status_code=400, detail="kind must be movie or series")
+    page = max(1, page)
+    limit = min(100, max(1, limit))
+    items = CATALOG.search(q, kind)
+    total = len(items)
+    start = (page - 1) * limit
+    payload: dict[str, Any] = {
+        "api_version": 1,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "items": [_public_item(item) for item in items[start:start + limit]],
+        "summary": CATALOG.summary(),
+    }
+    return JSONResponse(payload, headers={"ETag": _etag(payload), "Cache-Control": "max-age=15"})
+
+
+@api.get("/api/v1/catalog/{item_id}")
+async def catalog_v1_item(item_id: int):
+    item = CATALOG.get_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Catalog item not found")
+    payload: dict[str, Any] = {"api_version": 1, "item": _public_item(item)}
+    if item["kind"] == "series":
+        payload["seasons"] = CATALOG.list_seasons(item_id)
+        payload["episodes"] = [
+            {key: value for key, value in episode.items() if key != "stream_url"}
+            for episode in CATALOG.list_episodes(item_id)
+        ]
+    return JSONResponse(payload, headers={"ETag": _etag(payload), "Cache-Control": "max-age=15"})
+
+
+@api.get("/api/v1/catalog/{item_id}/play")
+async def catalog_v1_movie_play(item_id: int):
+    item = CATALOG.get_item(item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Catalog item not found")
+    if item["kind"] != "movie":
+        raise HTTPException(status_code=400, detail="Use the episode play endpoint for a series")
+    if not item.get("stream_url"):
+        raise HTTPException(status_code=409, detail="This title has no playable stream yet")
+    return JSONResponse({"api_version": 1, "type": "movie", "item_id": item_id, "stream_url": item["stream_url"]})
+
+
+@api.get("/api/v1/catalog/{series_id}/episodes/{episode_id}/play")
+async def catalog_v1_episode_play(series_id: int, episode_id: int):
+    series = CATALOG.get_item(series_id)
+    if not series or series["kind"] != "series":
+        raise HTTPException(status_code=404, detail="Series not found")
+    episode = next((row for row in CATALOG.list_episodes(series_id) if int(row["id"]) == episode_id), None)
+    if not episode:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    if not episode.get("stream_url"):
+        raise HTTPException(status_code=409, detail="This episode has no playable stream yet")
+    return JSONResponse({
+        "api_version": 1,
+        "type": "episode",
+        "series_id": series_id,
+        "episode_id": episode_id,
+        "season_number": episode["season_number"],
+        "episode_number": episode["episode_number"],
+        "title": episode["title"],
+        "stream_url": episode["stream_url"],
+    })
+
+
+@api.get("/", response_class=HTMLResponse)
+async def dashboard():
+    html = f"""<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Telegram Stream Dashboard</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; padding: 24px 16px; }}
+    h1 {{ font-size: 1.6rem; color: #fff; margin-bottom: 6px; }}
+    .subtitle {{ color: #888; font-size: 0.9rem; margin-bottom: 28px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 28px; }}
+    .card {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 20px 16px; text-align: center; }}
+    .card .num {{ font-size: 2rem; font-weight: 700; color: #4f9eff; }}
+    .card .label {{ font-size: 0.8rem; color: #888; margin-top: 6px; }}
+    .section {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; padding: 20px; margin-bottom: 20px; }}
+    .section h2 {{ font-size: 1rem; color: #aaa; margin-bottom: 14px; border-bottom: 1px solid #2a2a2a; padding-bottom: 10px; }}
+    .row {{ display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #222; font-size: 0.88rem; }}
+    .row:last-child {{ border-bottom: none; }}
+    .row .key {{ color: #888; }}
+    .row .val {{ color: #ddd; word-break: break-all; text-align: left; max-width: 65%; }}
+    .status-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #22c55e; margin-left: 8px; animation: pulse 2s infinite; }}
+    @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
+    .how {{ background: #111; border: 1px solid #2a2a2a; border-radius: 8px; padding: 14px 16px; font-size: 0.82rem; color: #aaa; line-height: 1.8; }}
+    .how code {{ background: #222; padding: 2px 6px; border-radius: 4px; color: #4f9eff; font-size: 0.8rem; }}
+  </style>
+</head>
+<body>
+  <h1>📡 Telegram Stream Server <span class="status-dot"></span></h1>
+  <p class="subtitle">MTProto streaming — בוט יחיד, בלי 20MB limit</p>
+  <div class="grid">
+    <div class="card"><div class="num">{stats['files_processed']}</div><div class="label">קבצים שהתקבלו</div></div>
+    <div class="card"><div class="num">{stats['links_generated']}</div><div class="label">קישורים שנוצרו</div></div>
+    <div class="card"><div class="num" style="font-size:1rem;margin-top:8px">{stats['started_at'][:10]}</div><div class="label">פעיל מאז</div></div>
+  </div>
+  <div class="section">
+    <h2>📊 מידע נוסף</h2>
+    <div class="row"><span class="key">קובץ אחרון</span><span class="val">{stats['last_file'] or '—'}</span></div>
+    <div class="row"><span class="key">פינג אחרון</span><span class="val">{stats['last_ping'] or '—'}</span></div>
+    <div class="row"><span class="key">Base URL</span><span class="val">{BASE_URL}</span></div>
+  </div>
+  <div class="section">
+    <h2>🎬 איך משתמשים?</h2>
+    <div class="how">
+      1. שלח לבוט קובץ וידאו / אודיו<br>
+      2. קבל קישור סטרימינג מיידי ✅<br>
+      3. עובד בכל נגן עם Seek מלא, גם מעל 20MB 🎬<br><br>
+      <strong>פורמט URL:</strong><br>
+      <code>{BASE_URL}/stream/CHAT_ID/MESSAGE_ID</code>
+    </div>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+# ── Bot handler ───────────────────────────────────────────────────────────────
+
+@bot_client.on_message((filters.private | filters.group | filters.channel) & (filters.video | filters.audio | filters.document | filters.video_note))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
+async def handle_media(client: Client, message: Message):
+    if await reject_unauthorized(message):
+        return
+    stats["files_processed"] += 1
+    wait_msg: Message = await cast(Any, message).reply_text("⏳ מעבד...")
+
+    try:
+        media     = message.video or message.audio or message.document or message.video_note
+        file_name = getattr(media, "file_name", "קובץ")
+        file_size = getattr(media, "file_size", 0)
+        size_mb   = round(file_size / 1024 / 1024, 1)
+
+        # אין יותר copy/forward — מזרימים ישירות מההודעה המקורית
+        # שבה הבוט עצמו קיבל את הקובץ (message.chat.id / message.id).
+        stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
+
+        user_id = message.from_user.id if message.from_user else 0
+        state = user_states.get(user_id)
+        upload_id = CATALOG.save_upload(
+            file_name, file_size, getattr(media, "mime_type", ""), stream_url,
+            message.chat.id, message.id,
+        )
+        if state and state.get("step") == "batch_media":
+            episode_number = int(state["next_episode"])
+            episode_id = CATALOG.add_episode(
+                int(state["series_id"]), int(state["season"]), episode_number,
+                f"פרק {episode_number}", stream_url,
+            )
+            CATALOG.attach_upload(upload_id, episode_id)
+            state["next_episode"] = episode_number + 1
+            await wait_msg.edit_text(
+                f"✅ נוסף עונה {state['season']} פרק {episode_number}.\n"
+                "שלח את הקובץ הבא או לחץ ✅ סיום."
+            )
+            return
+        if state and state.get("step") == "media":
+            data = state["data"]
+            if state["flow"] == "movie":
+                item_id = CATALOG.add_item(
+                    "movie", data["title"], data["summary"], data["year"],
+                    data["poster_url"], stream_url, data.get("backdrop_url", ""),
+                    data.get("rating"), data.get("tmdb_id"),
+                )
+                CATALOG.attach_upload(upload_id, item_id)
+                result = f"✅ הסרט **{data['title']}** נוסף לקטלוג (#{item_id})."
+            else:
+                series_id = int(data["series_id"])
+                episode_id = CATALOG.add_episode(
+                    series_id, data["season"], data["episode"], data["title"], stream_url,
+                )
+                CATALOG.attach_upload(upload_id, episode_id)
+                result = (
+                    f"✅ פרק {data['episode']} בעונה {data['season']} נוסף לסדרה "
+                    f"**{data['series_title']}**."
+                )
+            user_states.pop(user_id, None)
+            await wait_msg.edit_text(result)
+            return
+
+        parsed_caption = parse_media_caption(message.caption or "")
+        if parsed_caption:
+            result = await auto_catalog_media(parsed_caption, stream_url, upload_id)
+            if result:
+                await wait_msg.edit_text(result)
+                return
+
+        partial = parse_partial_episode_reference(message.caption or "")
+        chat_type = getattr(message.chat, "type", "")
+        is_channel = (
+            getattr(chat_type, "value", chat_type) == "channel"
+            or getattr(chat_type, "name", "").lower() == "channel"
+        )
+        if is_channel:
+            stats["links_generated"] += 1
+            stats["last_file"] = f"{file_name} ({size_mb}MB)"
+            await wait_msg.edit_text(
+                "✅ הקובץ התקבל בערוץ ונוצר קישור סטרימינג.\n\n"
+                f"🔗 `{stream_url}`\n\n"
+                "כדי לשייך אותו לקטלוג, צרף כיתוב לפוסט בפורמט:\n"
+                "`שם הסדרה עונה 1 פרק 1`"
+            )
+            return
+        user_states[user_id] = {
+            "flow": "unlabeled_media",
+            "step": "unlabeled_series",
+            "data": {
+                "upload_id": upload_id,
+                "stream_url": stream_url,
+                "file_name": file_name,
+                "season": partial["season"],
+                "episode": partial["episode"],
+            },
+        }
+        await wait_msg.edit_text(
+            "📺 קיבלתי את הקובץ.\n"
+            "לאיזו סדרה הוא שייך? כתוב את שם הסדרה."
+        )
+        return
+
+        stats["links_generated"] += 1
+        stats["last_file"] = f"{file_name} ({size_mb}MB)"
+
+        await wait_msg.edit_text(
+            f"✅ **קישור סטרימינג מוכן!**\n\n"
+            f"📄 קובץ: `{file_name}`\n"
+            f"📦 גודל: {size_mb} MB\n\n"
+            f"🔗 **קישור:**\n`{stream_url}`\n\n"
+            f"_הקישור תומך ב-Seek מלא ועובד בכל נגן_ 🎬"
+        )
+        log.info("Stream link: %s", stream_url)
+
+    except Exception as e:
+        log.exception("Error handling media")
+        await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
+
+
+@bot_client.on_message((filters.private | filters.group | filters.channel) & filters.command("start"))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
+async def start_command(client: Client, message: Message):
+    if await reject_unauthorized(message):
+        return
+    await cast(Any, message).reply_text(
+        "👋 **שלום!**\n\n"
+        "אני מנהל קטלוג סרטים וסדרות, יוצר קישורי סטרימינג ומדבר איתך גם בטקסט.\n\n"
+        "בחר פעולה מהתפריט או כתוב /help לקבלת פקודות.\n\n"
+        "שלח קובץ בכל רגע כדי לקבל קישור סטרימינג. ✅",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+def is_admin(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id in ADMIN_USER_IDS)
+
+
+def is_owner(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id == OWNER_USER_ID)
+
+
+def is_user_allowed(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else 0
+    return bool(
+        user_id
+        and (user_id == OWNER_USER_ID or user_id in ADMIN_USER_IDS
+             or CATALOG.is_user_approved(user_id))
+    )
+
+
+def refresh_admins() -> None:
+    ADMIN_USER_IDS.clear()
+    ADMIN_USER_IDS.update(CATALOG.list_admins())
+    ADMIN_USER_IDS.add(OWNER_USER_ID)
+
+
+def chat_type_name(chat: Any) -> str:
+    chat_type = getattr(chat, "type", "")
+    return str(getattr(chat_type, "value", chat_type)).lower()
+
+
+def is_chat_allowed(message: Message) -> bool:
+    if chat_type_name(message.chat) in {"private", "bot"}:
+        return True
+    chat_id = int(getattr(message.chat, "id", 0) or 0)
+    return bool(chat_id and CATALOG.is_chat_registered(chat_id))
+
+
+async def reject_unauthorized(message: Message) -> bool:
+    private_chat = chat_type_name(message.chat) in {"private", "bot"}
+    allowed = is_user_allowed(message) if private_chat else is_chat_allowed(message)
+    if allowed:
+        return False
+    scope = (
+        f"user:{message.from_user.id}"
+        if private_chat and message.from_user
+        else f"chat:{getattr(message.chat, 'id', 0)}"
+    )
+    if CATALOG.claim_access_notice(scope):
+        await cast(Any, message).reply_text(
+            "⛔ אין לך הרשאות להפעיל את הבוט.\n"
+            "יש לפנות למנהל אלון נושם."
+        )
+    return True
+
+
+async def reply(message: Message, text: str, keyboard: Any = MAIN_KEYBOARD) -> None:
+    await cast(Any, message).reply_text(text, reply_markup=keyboard)
+
+
+def is_skip_word(text: str) -> bool:
+    return text.strip().casefold().replace("⏭️ ", "") in SKIP_WORDS
+
+
+def parse_episode_reference(text: str) -> tuple[str, Optional[int], Optional[int]]:
+    patterns = [
+        r"^(.*?)\s+(?:עונה|ע)\s*(\d+)\s+(?:פרק|פ)\s*(\d+)\s*$",
+        r"^(.*?)\s+(?:season)\s*(\d+)\s+(?:episode|ep)\s*(\d+)\s*$",
+        r"^(.*?)\s+s(\d+)\s*e(\d+)\s*$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text.strip(), flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(), int(match.group(2)), int(match.group(3))
+    return text.strip(), None, None
+
+
+def parse_series_season_reference(text: str) -> tuple[str, Optional[int]]:
+    cleaned = re.sub(r"^\s*(?:סדרה|series)\s*:?\s*", "", text.strip(), flags=re.IGNORECASE)
+    pattern = r"^(.*?)\s+(?:עונה|ע|season|s)\s*(\d+)\s*$"
+    match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+    if not match:
+        return cleaned, None
+    return match.group(1).strip(), int(match.group(2))
+
+
+def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
+    lines = [
+        re.sub(
+            r"\.(?:mkv|mp4|avi|mov|m4v|webm|ts)\s*$",
+            "",
+            re.sub(r"[*_`>#]", "", line).strip(),
+            flags=re.IGNORECASE,
+        )
+        for line in caption.splitlines()
+    ]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+    quality = ""
+    genre = ""
+    poster_url = ""
+    for line in lines:
+        quality_match = re.match(r"(?:איכות|quality)\s*:?\s*(.+)$", line, flags=re.IGNORECASE)
+        if quality_match:
+            quality = quality_match.group(1).strip()
+        genre_match = re.match(r"(?:ז['׳]?אנר|genre)\s*:?\s*(.+)$", line, flags=re.IGNORECASE)
+        if genre_match:
+            genre = genre_match.group(1).strip()
+        poster_match = re.match(r"(?:פוסטר|poster)\s*:?\s*(https?://\S+)", line, flags=re.IGNORECASE)
+        if poster_match:
+            poster_url = poster_match.group(1).strip()
+
+    ignored_prefixes = (
+        "תרגום", "איכות", "ז'אנר", "זאנר", "תקציר", "נקרע",
+        "הועלה", "עבור", "קרדיט", "מקודד",
+    )
+
+    episode_patterns = [
+        r"^(?:סדרה\s*:\s*)?(.+?)\s+(?:עונה|ע)\s*(\d+)\s+(?:פרק|פ)\s*(\d+)",
+        r"^(?:series\s*:\s*)?(.+?)\s+season\s*(\d+)\s+(?:episode|ep)\s*(\d+)",
+        r"^(?:series\s*:\s*)?(.+?)\s+s(\d{1,2})\s*e(\d{1,2})",
+    ]
+    for line in lines[:3]:
+        for pattern in episode_patterns:
+            match = re.match(pattern, line, flags=re.IGNORECASE)
+            if match:
+                title_candidates = [match.group(1).strip(" :-")]
+                for alternate_line in lines[1:3]:
+                    if (
+                        re.search(r"[A-Za-z]", alternate_line)
+                        and not alternate_line.casefold().startswith(ignored_prefixes)
+                    ):
+                        title_candidates.append(alternate_line)
+                return {
+                    "kind": "episode",
+                    "title_candidates": title_candidates,
+                    "season": int(match.group(2)),
+                    "episode": int(match.group(3)),
+                    "quality": quality,
+                    "genre": genre,
+                }
+
+    title_lines = [line for line in lines if not line.casefold().startswith(ignored_prefixes)]
+    if not title_lines:
+        return None
+    title_candidates = [re.sub(r"\b(?:19|20)\d{2}\b", "", title_lines[0]).strip(" :-")]
+    if len(title_lines) > 1 and re.search(r"[A-Za-z]", title_lines[1]):
+        title_candidates.append(title_lines[1])
+    year_match = re.search(r"\b((?:19|20)\d{2})\b", lines[0])
+    summary = ""
+    for index, line in enumerate(lines):
+        if line.casefold().startswith(("תקציר", "summary")):
+            summary_parts: list[str] = []
+            for summary_line in lines[index + 1:]:
+                if summary_line.casefold().startswith(ignored_prefixes):
+                    break
+                summary_parts.append(summary_line)
+            summary = " ".join(summary_parts).strip()
+            summary = re.split(r"\s+(?:הועלה|עבור|קרדיט|מקודד)\b", summary, maxsplit=1)[0].strip()
+            break
+    return {
+        "kind": "movie",
+        "title_candidates": [candidate for candidate in title_candidates if candidate],
+        "year": int(year_match.group(1)) if year_match else None,
+        "quality": quality,
+        "genre": genre,
+        "summary": summary,
+        "poster_url": poster_url,
+    }
+
+
+def parse_partial_episode_reference(caption: str) -> dict[str, Optional[int]]:
+    """Extract season/episode numbers when a media caption has no series title."""
+    text = re.sub(r"[*_`>#]", "", caption or "").strip()
+    season: Optional[int] = None
+    episode: Optional[int] = None
+    match = re.search(r"\bs(\d{1,2})\s*e(\d{1,2})\b", text, flags=re.IGNORECASE)
+    if match:
+        season, episode = int(match.group(1)), int(match.group(2))
+    else:
+        season_match = re.search(r"\b(?:עונה|season|s)\s*(\d+)\b", text, flags=re.IGNORECASE)
+        episode_match = re.search(
+            r"\b(?:פרק|episode|ep|e)\s*(\d+)\b", text, flags=re.IGNORECASE,
+        )
+        season = int(season_match.group(1)) if season_match else None
+        episode = int(episode_match.group(1)) if episode_match else None
+    return {"season": season, "episode": episode}
+
+
+async def auto_catalog_media(
+    metadata: dict[str, Any],
+    stream_url: str,
+    upload_id: int,
+) -> Optional[str]:
+    candidates = metadata["title_candidates"]
+    kind = metadata["kind"]
+    match: Optional[dict[str, Any]] = None
+    for candidate in candidates:
+        try:
+            matches = await TMDB.search(candidate, "series" if kind == "episode" else "movie")
+        except Exception as error:
+            log.warning("Automatic TMDB lookup failed: %s", error)
+            matches = []
+        if matches:
+            match = matches[0]
+            break
+
+    if match and not metadata.get("genre") and match.get("tmdb_id"):
+        try:
+            match = await TMDB.details(int(match["tmdb_id"]), "series" if kind == "episode" else "movie")
+        except Exception as error:
+            log.warning("TMDB details lookup failed: %s", error)
+
+    if kind == "episode":
+        series_title = match["title"] if match else candidates[0]
+        series = find_item(series_title, "series")
+        if not series:
+            series = find_item(candidates[0], "series")
+        if not series:
+            series_id = CATALOG.add_item(
+                "series", series_title,
+                match["summary"] if match else "",
+                match["release_year"] if match else None,
+                match["poster_url"] if match else "",
+                "",
+                match["backdrop_url"] if match else "",
+                match["rating"] if match else None,
+                match["tmdb_id"] if match else None,
+                metadata.get("genre", "") or (match.get("genre", "") if match else ""),
+            )
+        else:
+            series_id = int(series["id"])
+        episode_id = CATALOG.add_episode(
+            series_id, metadata["season"], metadata["episode"],
+            f"פרק {metadata['episode']}", stream_url, metadata.get("quality", ""),
+        )
+        CATALOG.attach_upload(upload_id, episode_id)
+        return f"📺 נשמר אוטומטית: {series_title}, עונה {metadata['season']} פרק {metadata['episode']} ✅"
+
+    title = match["title"] if match else candidates[0]
+    tmdb_values = match or {}
+    summary = metadata.get("summary", "") or tmdb_values.get("summary", "")
+    release_year = metadata.get("year") or tmdb_values.get("release_year")
+    poster_url = metadata.get("poster_url", "") or tmdb_values.get("poster_url", "")
+    genre = metadata.get("genre", "") or tmdb_values.get("genre", "")
+    existing = find_item(title, "movie")
+    if existing:
+        item_id = int(existing["id"])
+        updates: dict[str, Any] = {"stream_url": stream_url}
+        if summary:
+            updates["summary"] = summary
+        if release_year:
+            updates["release_year"] = release_year
+        if poster_url:
+            updates["poster_url"] = poster_url
+        if metadata.get("quality"):
+            updates["quality"] = metadata["quality"]
+        if genre:
+            updates["genre"] = genre
+        CATALOG.update_item(item_id, **updates)
+    else:
+        item_id = CATALOG.add_item(
+            "movie", title, summary, release_year,
+            poster_url, stream_url,
+            tmdb_values.get("backdrop_url", ""), tmdb_values.get("rating"),
+            tmdb_values.get("tmdb_id"),
+            metadata.get("quality", ""),
+            genre,
+        )
+    CATALOG.attach_upload(upload_id, item_id)
+    return f"🎬 נשמר אוטומטית: {title} ✅"
+
+
+def begin_flow(user_id: int, flow: str) -> None:
+    user_states[user_id] = {"flow": flow, "step": "title", "data": {}}
+
+
+def find_item(query: str, kind: Optional[str] = None) -> Optional[dict[str, Any]]:
+    results = CATALOG.search(query, kind)
+    if not results:
+        return None
+    exact = [item for item in results if item["title"].casefold() == query.casefold()]
+    return exact[0] if exact else results[0]
+
+
+async def show_list(message: Message) -> None:
+    items = CATALOG.list_items()
+    summary = CATALOG.summary()
+    if not items:
+        await reply(message, "📚 הקטלוג עדיין ריק.")
+        return
+    lines = [
+        f"📚 **הקטלוג שלך** | 🎬 {summary['movies']} סרטים | 📺 {summary['series']} סדרות",
+        "",
+    ]
+    for item in items:
+        icon = "🎬" if item["kind"] == "movie" else "📺"
+        year = f" ({item['release_year']})" if item["release_year"] else ""
+        lines.append(f"{icon} **{item['title']}**{year} · #{item['id']}")
+    await reply(message, "\n".join(lines))
+
+
+async def show_report(message: Message) -> None:
+    report = CATALOG.integrity_report()
+    duplicates = report["duplicates"]
+    missing_episodes = report["missing_episodes"]
+    if not duplicates and not missing_episodes:
+        await reply(message, "📊 **דוח קטלוג**\n\n✅ לא נמצאו כפילויות או פרקים חסרים.")
+        return
+
+    lines = ["📊 **דוח קטלוג**", ""]
+    if duplicates:
+        lines.append("⚠️ **כפילויות:**")
+        for duplicate in duplicates:
+            kind = "סרט" if duplicate["kind"] == "movie" else "סדרה"
+            ids = ", ".join(f"#{item_id}" for item_id in duplicate["item_ids"])
+            lines.append(f"• {kind}: **{duplicate['title']}** ({ids})")
+        lines.append("")
+    if missing_episodes:
+        lines.append("⚠️ **פרקים חסרים:**")
+        for gap in missing_episodes:
+            episodes = ", ".join(str(number) for number in gap["missing_episodes"])
+            lines.append(
+                f"• **{gap['series_title']}** — עונה {gap['season_number']}: "
+                f"חסר פרק {episodes}"
+            )
+    await reply(message, "\n".join(lines))
+
+
+async def show_browse_items(message: Message) -> None:
+    items = CATALOG.list_items()
+    if not items:
+        await reply(message, "📚 הקטלוג עדיין ריק.")
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    user_states[user_id] = {
+        "flow": "browse", "step": "browse_item", "data": {"items": items},
+    }
+    lines = ["🔗 בחר סרט או סדרה לפי מספר:", ""]
+    for index, item in enumerate(items, start=1):
+        icon = "🎬" if item["kind"] == "movie" else "📺"
+        lines.append(f"{index}. {icon} {item['title']}")
+    await reply(message, "\n".join(lines))
+
+
+async def show_section_menu(message: Message, section: str) -> None:
+    keyboard = MOVIES_KEYBOARD if section == "movies" else SERIES_KEYBOARD
+    title = "🎬 **פעולות סרטים**" if section == "movies" else "📺 **פעולות סדרות**"
+    await reply(message, f"{title}\nבחר פעולה:", keyboard)
+
+
+async def send_stream_link(message: Message, title: str, stream_url: str) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    user_states.pop(user_id, None)
+    if not stream_url:
+        await reply(message, "⚠️ לפריט הזה עדיין אין קישור סטרימינג.")
+        return
+    await reply(message, f"🔗 **קישור סטרימינג מוכן**\n\n🎬 {title}\n\n{stream_url}")
+
+
+async def show_guide(message: Message) -> None:
+    await reply(
+        message,
+        "📖 **מדריך הבוט**\n\n"
+        "🎬 **קטלוג**\n"
+        "➕ **הוסף סרט** — שם, תקציר, שנה, פוסטר ואז קובץ וידאו.\n"
+        "➕ **הוסף סדרה** — שם, תקציר, שנה ופוסטר.\n"
+        "➕ **הוסף פרק** — בחר סדרה, עונה, פרק וקובץ וידאו.\n"
+        "✏️ **עריכה** — בחר סרט או סדרה ושדה לעדכון.\n"
+        "🗑️ **מחיקה** — תמיד נדרשת תשובת אישור.\n\n"
+        "📦 **העלאת עונה**\n"
+        "כתוב: `סדרה: פאודה`, והבוט ישאל איזו עונה להעלות.\n"
+        "אפשר גם לכתוב ישירות `סדרה: פאודה עונה 2`.\n"
+        "לאחר בחירת העונה שלח את הקבצים לפי הסדר, מהפרק הראשון ועד האחרון.\n"
+        "בסיום לחץ על ✅ **סיום**.\n\n"
+        "🔗 **צפייה וסטרימינג**\n"
+        "לחץ על **קישור סטרימינג** או כתוב `/browse`.\n"
+        "בחר סרט, או סדרה → עונה → פרק.\n\n"
+        "📊 **בדיקת קטלוג**\n"
+        "לחץ על **דוח** או כתוב `/report` כדי למצוא כפילויות ופרקים חסרים.\n\n"
+        "🛠️ **ניהול**\n"
+        "הבעלים יכול לפתוח את **ניהול** או `/management` כדי לאשר משתמשים, מנהלים, קבוצות וערוצים.\n\n"
+        "👥 **קבוצות וערוצים**\n"
+        "רק צ׳אטים שאושרו על ידי הבעלים פעילים. בערוץ יש להוסיף את הבוט כמנהל ולצרף כיתוב עם סדרה, עונה ופרק.\n\n"
+        "🔎 **חיפוש**\n"
+        "כתוב שם של סרט או סדרה כדי לחפש בקטלוג.\n\n"
+        "⌨️ **פקודות**\n"
+        "`/add_movie` — הוסף סרט\n"
+        "`/add_series` — הוסף סדרה\n"
+        "`/add_episode` — הוסף פרק\n"
+        "`/edit_movie` — ערוך סרט\n"
+        "`/edit_series` — ערוך סדרה\n"
+        "`/remove_movie` — מחק סרט\n"
+        "`/remove_series` — מחק סדרה\n"
+        "`/remove_season` — מחק עונה\n"
+        "`/remove_episode` — מחק פרק\n"
+        "`/list` — הצג קטלוג\n"
+        "`/report` — הצג דוח\n"
+        "`/about` — אודות הבוט\n"
+        "`/management` — ניהול הבוט\n"
+        "`/cancel` — בטל פעולה",
+    )
+
+
+async def show_about(message: Message) -> None:
+    await reply(
+        message,
+        "ℹ️ **אודות הבוט**\n\n"
+        "בוט לניהול קטלוג סרטים וסדרות, העלאת פרקים ויצירת קישורי סטרימינג.\n"
+        "הקבצים נשארים ב־Telegram, והמערכת שומרת בקטלוג רק את פרטי ההודעה הדרושים לסטרימינג.\n"
+        "תמיכה בפרטי, קבוצות וערוצים.\n\n"
+        "הוכן והועלה על ידי **אלון נושם**.",
+    )
+
+
+async def show_management(message: Message) -> None:
+    admins = CATALOG.list_admins()
+    users = CATALOG.list_users()
+    chats = CATALOG.list_bot_chats()
+    chat_lines = [
+        f"• {chat['title'] or 'ללא שם'} ({chat['chat_type']}) · `{chat['chat_id']}`"
+        for chat in chats
+    ] or ["• עדיין לא נרשמו קבוצות או ערוצים."]
+    await reply(
+        message,
+        "🛠️ **ניהול הבוט**\n\n"
+        f"מנהלים: **{len(admins)}**\n"
+        f"משתמשים מאושרים: **{len(users)}**\n"
+        f"קבוצות וערוצים פעילים: **{len(chats)}**\n\n"
+        "כדי לאשר קבוצה או ערוץ, הוסף את הבוט ידנית והשתמש בכפתור המתאים עם ה־chat ID.\n"
+        "צ׳אט שלא אושר יקבל הודעת הרשאה אחת והבוט יצא ממנו אוטומטית.\n\n"
+        "📋 **צ׳אטים רשומים**\n" + "\n".join(chat_lines),
+        MANAGEMENT_KEYBOARD,
+    )
+
+
+async def register_chat_by_id(message: Message, chat_id: int, expected_type: str) -> None:
+    try:
+        chat = await bot_client.get_chat(chat_id)
+    except Exception as error:
+        log.warning("Could not load chat %s: %s", chat_id, error)
+        await reply(message, "❌ לא הצלחתי למצוא את הצ׳אט. ודא שהבוט נמצא בו ושה־chat ID נכון.", MANAGEMENT_KEYBOARD)
+        return
+    actual_type = chat_type_name(chat)
+    valid_types = {"group", "supergroup"} if expected_type == "group" else {"channel"}
+    if actual_type not in valid_types:
+        await reply(message, f"❌ ה־chat ID הזה אינו {expected_type}.", MANAGEMENT_KEYBOARD)
+        return
+    resolved_chat_id = int(getattr(chat, "id", 0) or 0)
+    if not resolved_chat_id:
+        await reply(message, "❌ Telegram לא החזיר מזהה תקין לצ׳אט.", MANAGEMENT_KEYBOARD)
+        return
+    title = getattr(chat, "title", "") or str(resolved_chat_id)
+    CATALOG.register_chat(
+        resolved_chat_id, title,
+        actual_type, OWNER_USER_ID,
+    )
+    await reply(message, f"✅ {title} נוסף לרשימת הצ׳אטים הפעילים.", MANAGEMENT_KEYBOARD)
+
+
+async def start_action(message: Message, action: str) -> None:
+    if action == "about":
+        await show_about(message)
+        return
+    if action == "management":
+        if not is_owner(message):
+            await reply(message, "🔒 ניהול הרשאות וצ׳אטים זמין רק לבעלים.")
+            return
+        await show_management(message)
+        return
+    if action == "management_list":
+        if is_owner(message):
+            await show_management(message)
+        else:
+            await reply(message, "🔒 ניהול הרשאות וצ׳אטים זמין רק לבעלים.")
+        return
+    management_actions = {
+        "add_admin", "remove_admin", "add_user", "remove_user",
+        "add_group", "add_channel", "remove_chat",
+    }
+    if action in management_actions and not is_owner(message):
+        await reply(message, "🔒 ניהול הרשאות וצ׳אטים זמין רק לבעלים.")
+        return
+    if action in management_actions:
+        prompts = {
+            "add_admin": "➕ שלח את מזהה המשתמש של המנהל החדש.",
+            "remove_admin": "➖ שלח את מזהה המשתמש של המנהל להסרה.",
+            "add_user": "✅ שלח את מזהה המשתמש הפרטי שברצונך לאשר.",
+            "remove_user": "🗑️ שלח את מזהה המשתמש להסרה.",
+            "add_group": (
+                "✅ כדי למצוא את ה־chat ID, פתח את @userinfobot:\n"
+                "https://t.me/userinfobot\n\n"
+                "העתק את ה־ID של הקבוצה, הוסף את הבוט לקבוצה, ושלח כאן את ה־ID כדי לאשר אותה."
+            ),
+            "add_channel": (
+                "✅ כדי למצוא את ה־chat ID, פתח את @userinfobot:\n"
+                "https://t.me/userinfobot\n\n"
+                "העתק את ה־ID של הערוץ, הוסף את הבוט לערוץ כמנהל, ושלח כאן את ה־ID כדי לאשר אותו."
+            ),
+            "remove_chat": "🗑️ שלח את ה־chat ID להסרה מהרשימה.",
+        }
+        user_id = message.from_user.id if message.from_user else 0
+        user_states[user_id] = {"flow": "management", "step": action, "data": {}}
+        await reply(message, prompts[action], MANAGEMENT_KEYBOARD)
+        return
+    if not is_admin(message):
+        await reply(message, "🔒 הפעולה הזו זמינה למנהלים בלבד.")
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    if action in {"movie", "series", "episode", "edit", "edit_movie", "edit_series", "remove_movie", "remove_series", "remove_season", "remove_episode"}:
+        begin_flow(user_id, action)
+        prompts = {
+            "movie": "🎬 מה שם הסרט?",
+            "series": "📺 מה שם הסדרה?",
+            "episode": "📺 איך קוראים לסדרה שאליה מוסיפים את הפרק?",
+            "edit": "✏️ איזו סדרה לערוך?",
+            "edit_series": "✏️ איזו סדרה לערוך?",
+            "edit_movie": "✏️ איזה סרט לערוך?",
+            "remove_movie": "🗑️ איזה סרט להסיר?",
+            "remove_series": "🗑️ איזו סדרה להסיר?",
+            "remove_season": "🗑️ מאיזו סדרה להסיר עונה?",
+            "remove_episode": "🗑️ מאיזו סדרה להסיר פרק?",
+        }
+        user_states[user_id]["step"] = "lookup" if action in {"episode", "edit", "edit_movie", "edit_series", "remove_movie", "remove_series", "remove_season", "remove_episode"} else "title"
+        if action in {"edit_movie", "edit_series", "remove_movie"}:
+            user_states[user_id]["data"]["kind"] = "movie" if action == "edit_movie" else "series"
+            if action == "remove_movie":
+                user_states[user_id]["data"]["kind"] = "movie"
+        await reply(message, prompts[action])
+        return
+    if action == "list":
+        await show_list(message)
+    elif action == "report":
+        await show_report(message)
+    elif action == "browse":
+        await show_browse_items(message)
+    elif action == "guide":
+        await show_guide(message)
+
+
+async def begin_season_upload(message: Message, text: str) -> None:
+    if not is_admin(message):
+        await reply(message, "🔒 הפעולה הזו זמינה למנהלים בלבד.")
+        return
+    series_title, season_number = parse_series_season_reference(text)
+    series = find_item(series_title, "series")
+    if not series:
+        series_id = CATALOG.add_item("series", series_title)
+        series = CATALOG.get_item(series_id)
+        if not series:
+            await reply(message, "❌ לא הצלחתי ליצור את הסדרה. נסה שוב.")
+            return
+        created_message = f"\n✅ יצרתי את הסדרה **{series_title}** בקטלוג."
+    else:
+        created_message = ""
+    if season_number is None:
+        user_id = message.from_user.id if message.from_user else 0
+        user_states[user_id] = {
+            "flow": "batch_episode",
+            "step": "batch_season",
+            "series_id": series["id"],
+            "series_title": series["title"],
+        }
+        await reply(
+            message,
+            f"📺 הסדרה **{series['title']}** מוכנה.\n"
+            "🔢 איזו עונה אתה מעלה? כתוב מספר, למשל `1`.",
+        )
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    user_states[user_id] = {
+        "flow": "batch_episode",
+        "step": "batch_media",
+        "series_id": series["id"],
+        "series_title": series["title"],
+        "season": season_number,
+        "next_episode": 1,
+    }
+    await reply(
+        message,
+        f"📺 מצב העלאת עונה הופעל עבור **{series['title']}**, עונה {season_number}.\n\n"
+        "שלח את קבצי הפרקים לפי הסדר. הראשון יישמר כפרק 1, השני כפרק 2 וכן הלאה."
+        f"{created_message}",
+        UPLOAD_SEASON_KEYBOARD,
+    )
+
+
+async def finish_unlabeled_episode(message: Message, state: dict[str, Any]) -> None:
+    data = state["data"]
+    episode_number = int(data["episode"])
+    episode_id = CATALOG.add_episode(
+        int(data["series_id"]), int(data["season"]), episode_number,
+        f"פרק {episode_number}", data["stream_url"],
+    )
+    CATALOG.attach_upload(int(data["upload_id"]), episode_id)
+    user_states.pop(message.from_user.id if message.from_user else 0, None)
+    await reply(
+        message,
+        f"✅ נשמר: **{data['series_title']}** — עונה {data['season']} פרק {episode_number}.",
+    )
+
+
+async def handle_state(message: Message, state: dict[str, Any], text: str) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    flow = state["flow"]
+    step = state["step"]
+
+    if flow == "management":
+        if not is_owner(message):
+            user_states.pop(user_id, None)
+            await reply(message, "🔒 הפעולה הזו זמינה רק לבעלים.")
+            return
+        if step in {"add_admin", "remove_admin", "add_user", "remove_user"}:
+            if not text.isdigit() or int(text) <= 0:
+                await reply(message, "❌ מזהה משתמש חייב להיות מספר חיובי.", MANAGEMENT_KEYBOARD)
+                return
+            target_id = int(text)
+            if step == "add_admin":
+                CATALOG.add_admin(target_id)
+                CATALOG.add_user(target_id, OWNER_USER_ID)
+                refresh_admins()
+                result = f"✅ המשתמש `{target_id}` נוסף כמנהל."
+            elif step == "add_user":
+                CATALOG.add_user(target_id, OWNER_USER_ID)
+                result = f"✅ המשתמש `{target_id}` אושר לשימוש בפרטי."
+            elif target_id == OWNER_USER_ID:
+                result = "❌ אי אפשר להסיר את הבעלים הראשי."
+            elif step == "remove_user":
+                CATALOG.remove_user(target_id)
+                result = f"✅ המשתמש `{target_id}` הוסר מרשימת המשתמשים המאושרים."
+            else:
+                CATALOG.remove_admin(target_id)
+                CATALOG.remove_user(target_id)
+                refresh_admins()
+                result = f"✅ המשתמש `{target_id}` הוסר מרשימת המנהלים."
+            user_states.pop(user_id, None)
+            await reply(message, result, MANAGEMENT_KEYBOARD)
+            return
+        if step in {"add_group", "add_channel", "remove_chat"}:
+            try:
+                chat_id = int(text)
+            except ValueError:
+                await reply(message, "❌ chat ID חייב להיות מספר, בדרך כלל מתחיל ב־`-100`.", MANAGEMENT_KEYBOARD)
+                return
+            if step == "remove_chat":
+                CATALOG.unregister_chat(chat_id)
+                user_states.pop(user_id, None)
+                await reply(message, f"✅ הצ׳אט `{chat_id}` הוסר מהרשימה.", MANAGEMENT_KEYBOARD)
+            else:
+                expected_type = "group" if step == "add_group" else "channel"
+                user_states.pop(user_id, None)
+                await register_chat_by_id(message, chat_id, expected_type)
+            return
+
+    if step == "batch_season":
+        if not text.isdigit() or int(text) < 1:
+            await reply(message, "🔢 מספר עונה חייב להיות מספר חיובי. נסה שוב.")
+            return
+        state.update({
+            "step": "batch_media",
+            "season": int(text),
+            "next_episode": 1,
+        })
+        await reply(
+            message,
+            f"📺 מצב העלאת עונה הופעל עבור **{state['series_title']}**, עונה {text}.\n\n"
+            "שלח את קבצי הפרקים לפי הסדר. הראשון יישמר כפרק 1, השני כפרק 2 וכן הלאה.",
+            UPLOAD_SEASON_KEYBOARD,
+        )
+        return
+
+    data = state["data"]
+
+    if step == "unlabeled_series":
+        series = find_item(text, "series")
+        if not series:
+            series_id = CATALOG.add_item("series", text)
+            series = CATALOG.get_item(series_id)
+        if not series:
+            await reply(message, "❌ לא הצלחתי ליצור את הסדרה. נסה שוב.")
+            return
+        data["series_id"] = int(series["id"])
+        data["series_title"] = series["title"]
+        if data["season"] is None:
+            state["step"] = "unlabeled_season"
+            await reply(message, "🔢 איזו עונה? כתוב מספר, למשל `2`.")
+        elif data["episode"] is None:
+            state["step"] = "unlabeled_episode"
+            await reply(message, "🔢 איזה פרק? כתוב מספר, למשל `2`.")
+        else:
+            await finish_unlabeled_episode(message, state)
+        return
+
+    if step == "unlabeled_season":
+        if not text.isdigit() or int(text) < 1:
+            await reply(message, "🔢 מספר עונה חייב להיות מספר חיובי. נסה שוב.")
+            return
+        data["season"] = int(text)
+        if data["episode"] is None:
+            state["step"] = "unlabeled_episode"
+            await reply(message, "🔢 איזה פרק? כתוב מספר, למשל `2`.")
+        else:
+            await finish_unlabeled_episode(message, state)
+        return
+
+    if step == "unlabeled_episode":
+        if not text.isdigit() or int(text) < 1:
+            await reply(message, "🔢 מספר פרק חייב להיות מספר חיובי. נסה שוב.")
+            return
+        data["episode"] = int(text)
+        await finish_unlabeled_episode(message, state)
+        return
+
+    if step == "browse_item":
+        items = data["items"]
+        if not text.isdigit() or not 1 <= int(text) <= len(items):
+            await reply(message, "❓ בחר מספר מהרשימה או לחץ ביטול.")
+            return
+        item = items[int(text) - 1]
+        if item["kind"] == "movie":
+            await send_stream_link(message, item["title"], item["stream_url"])
+            return
+        seasons = CATALOG.list_seasons(int(item["id"]))
+        if not seasons:
+            await reply(message, "⚠️ לסדרה הזו עדיין אין עונות.")
+            user_states.pop(user_id, None)
+            return
+        data["series_id"] = item["id"]
+        data["series_title"] = item["title"]
+        data["seasons"] = seasons
+        state["step"] = "browse_season"
+        await reply(message, "\n".join(
+            [f"📺 {item['title']} — בחר עונה לפי מספר:", ""]
+            + [f"{index}. עונה {season['season_number']}" for index, season in enumerate(seasons, 1)]
+        ))
+    elif step == "browse_season":
+        seasons = data["seasons"]
+        if not text.isdigit() or not 1 <= int(text) <= len(seasons):
+            await reply(message, "❓ בחר מספר עונה מהרשימה.")
+            return
+        season = seasons[int(text) - 1]
+        episodes = CATALOG.list_episodes(int(data["series_id"]), int(season["season_number"]))
+        if not episodes:
+            await reply(message, "⚠️ לעונה הזו עדיין אין פרקים.")
+            user_states.pop(user_id, None)
+            return
+        data["episodes"] = episodes
+        state["step"] = "browse_episode"
+        await reply(message, "\n".join(
+            [f"📺 {data['series_title']} — עונה {season['season_number']}, בחר פרק:", ""]
+            + [f"{index}. פרק {episode['episode_number']} — {episode['title']}" for index, episode in enumerate(episodes, 1)]
+        ))
+    elif step == "browse_episode":
+        episodes = data["episodes"]
+        if not text.isdigit() or not 1 <= int(text) <= len(episodes):
+            await reply(message, "❓ בחר מספר פרק מהרשימה.")
+            return
+        episode = episodes[int(text) - 1]
+        await send_stream_link(
+            message,
+            f"{data['series_title']} — עונה {episode['season_number']} פרק {episode['episode_number']}",
+            episode["stream_url"],
+        )
+    elif step == "title":
+        data["title"] = text
+        if flow in {"movie", "series"} and TMDB.enabled:
+            try:
+                matches = await TMDB.search(text, flow)
+            except Exception as error:
+                log.warning("TMDB search failed: %s", error)
+                matches = []
+            if matches:
+                data["tmdb_results"] = matches
+                state["step"] = "tmdb_choice"
+                lines = ["🔎 מצאתי ב-TMDB. בחר מספר, או כתוב `דלג` להזנה ידנית:", ""]
+                for index, match in enumerate(matches, start=1):
+                    year = f" ({match['release_year']})" if match["release_year"] else ""
+                    lines.append(f"{index}. {match['title']}{year} ⭐ {match['rating'] or '-'}")
+                await reply(message, "\n".join(lines), OPTIONAL_FIELD_KEYBOARD)
+                return
+        state["step"] = "summary"
+        await reply(message, "📝 כתוב תקציר קצר, או כתוב `דלג` / לחץ על ⏭️ דלג.", OPTIONAL_FIELD_KEYBOARD)
+    elif step == "tmdb_choice":
+        matches = data.get("tmdb_results", [])
+        if is_skip_word(text):
+            data.pop("tmdb_results", None)
+            state["step"] = "summary"
+            await reply(message, "📝 כתוב תקציר קצר, או כתוב `דלג`.", OPTIONAL_FIELD_KEYBOARD)
+            return
+        if not text.isdigit() or not 1 <= int(text) <= len(matches):
+            await reply(message, "❓ בחר מספר מהרשימה, או כתוב `דלג`.", OPTIONAL_FIELD_KEYBOARD)
+            return
+        selected = matches[int(text) - 1]
+        data.update({
+            "title": selected["title"], "summary": selected["summary"],
+            "year": selected["release_year"], "poster_url": selected["poster_url"],
+            "backdrop_url": selected["backdrop_url"], "rating": selected["rating"],
+            "tmdb_id": selected["tmdb_id"],
+        })
+        data.pop("tmdb_results", None)
+        if flow == "series":
+            item_id = CATALOG.add_item(
+                "series", data["title"], data["summary"], data["year"],
+                data["poster_url"], "", data["backdrop_url"], data["rating"], data["tmdb_id"],
+            )
+            user_states.pop(user_id, None)
+            await reply(message, f"✅ הסדרה **{data['title']}** נוספה מ-TMDB (#{item_id}).")
+        else:
+            state["step"] = "media"
+            await reply(message, "✅ הפרטים מולאו מ-TMDB. עכשיו שלח את קובץ הווידאו של הסרט.")
+    elif step == "summary":
+        data["summary"] = "" if is_skip_word(text) else text
+        state["step"] = "year"
+        await reply(message, "📅 מה שנת היציאה? אפשר לכתוב `דלג` או ללחוץ על הכפתור.", OPTIONAL_FIELD_KEYBOARD)
+    elif step == "year":
+        data["year"] = int(text) if text.isdigit() and not is_skip_word(text) else None
+        state["step"] = "poster"
+        await reply(message, "🖼️ שלח קישור לפוסטר, או כתוב `דלג`.", OPTIONAL_FIELD_KEYBOARD)
+    elif step == "poster":
+        data["poster_url"] = "" if is_skip_word(text) else text
+        if flow == "series":
+            item_id = CATALOG.add_item(
+                "series", data["title"], data["summary"], data["year"], data["poster_url"],
+                "", data.get("backdrop_url", ""), data.get("rating"), data.get("tmdb_id"),
+            )
+            user_states.pop(user_id, None)
+            await reply(message, f"✅ הסדרה **{data['title']}** נוספה לקטלוג (#{item_id}).")
+        elif flow == "movie":
+            state["step"] = "media"
+            await reply(message, "🎞️ מצוין. עכשיו שלח את קובץ הווידאו של הסרט.")
+    elif step == "lookup":
+        series_query, detected_season, detected_episode = parse_episode_reference(text)
+        lookup_kind = data.get("kind", "series")
+        item = find_item(series_query, lookup_kind)
+        if not item:
+            await reply(message, "❓ לא מצאתי סדרה כזו. נסה שוב או לחץ ביטול.")
+            return
+        data["series_id"] = item["id"]
+        data["series_title"] = item["title"]
+        if flow in {"edit", "edit_movie", "edit_series"}:
+            data["item_id"] = item["id"]
+            state["step"] = "edit_field"
+            await reply(message, "✏️ מה תרצה לערוך?", EDIT_FIELD_KEYBOARD)
+        elif flow == "remove_movie":
+            data["item_id"] = item["id"]
+            state["step"] = "confirm_movie"
+            await reply(message, f"⚠️ למחוק את הסרט **{item['title']}**? כתוב כן או לא.")
+        elif flow == "remove_series":
+            state["step"] = "confirm_series"
+            await reply(message, f"⚠️ למחוק את **{item['title']}** וכל הפרקים שלה? כתוב כן או לא.")
+        else:
+            if detected_season is not None and detected_episode is not None:
+                data["season"] = detected_season
+                data["episode"] = detected_episode
+                state["step"] = "episode_title"
+                await reply(message, "🎞️ זיהיתי את הסדרה, העונה והפרק. מה שם הפרק? אפשר לדלג.", OPTIONAL_FIELD_KEYBOARD)
+            else:
+                state["step"] = "season"
+                await reply(message, "🔢 מה מספר העונה? אפשר גם לכתוב למשל `פאודה עונה 1 פרק 1`.")
+    elif step == "edit_field":
+        fields = {
+            "✏️ שם": "title", "שם": "title", "name": "title",
+            "📝 תקציר": "summary", "תקציר": "summary", "summary": "summary",
+            "📅 שנת יציאה": "release_year", "שנת יציאה": "release_year", "year": "release_year",
+            "🖼️ פוסטר": "poster_url", "פוסטר": "poster_url", "poster": "poster_url",
+        }
+        field = fields.get(text.casefold())
+        if not field:
+            await reply(message, "❓ בחר שדה מתוך הכפתורים.", EDIT_FIELD_KEYBOARD)
+            return
+        data["edit_field"] = field
+        state["step"] = "edit_value"
+        prompts = {
+            "title": "✏️ מה השם החדש?",
+            "summary": "📝 מה התקציר החדש?",
+            "release_year": "📅 מה שנת היציאה החדשה?",
+            "poster_url": "🖼️ שלח קישור לפוסטר החדש.",
+        }
+        await reply(message, prompts[field], OPTIONAL_FIELD_KEYBOARD)
+    elif step == "edit_value":
+        field = data["edit_field"]
+        if is_skip_word(text):
+            user_states.pop(user_id, None)
+            await reply(message, "✅ העריכה בוטלה.")
+            return
+        if field == "release_year" and not text.isdigit():
+            await reply(message, "❓ השנה צריכה להיות מספר. נסה שוב.", OPTIONAL_FIELD_KEYBOARD)
+            return
+        value: Any = int(text) if field == "release_year" else text
+        CATALOG.update_item(data["item_id"], **{field: value})
+        user_states.pop(user_id, None)
+        await reply(message, "✅ העדכון נשמר בהצלחה.")
+    elif step == "season":
+        if not text.isdigit():
+            await reply(message, "🔢 מספר עונה חייב להיות מספר. נסה שוב.")
+            return
+        data["season"] = int(text)
+        if flow == "remove_season":
+            state["step"] = "confirm_season"
+            await reply(message, "⚠️ למחוק את העונה הזו וכל הפרקים שבה? כתוב כן או לא.")
+        else:
+            state["step"] = "episode"
+            await reply(message, "🔢 מה מספר הפרק?")
+    elif step == "episode":
+        if not text.isdigit():
+            await reply(message, "🔢 מספר פרק חייב להיות מספר. נסה שוב.")
+            return
+        data["episode"] = int(text)
+        if flow == "remove_episode":
+            state["step"] = "confirm_episode"
+            await reply(message, "⚠️ למחוק את הפרק הזה? כתוב כן או לא.")
+        else:
+            state["step"] = "episode_title"
+            await reply(message, "🎞️ מה שם הפרק? אפשר לכתוב `דלג`.", OPTIONAL_FIELD_KEYBOARD)
+    elif step == "episode_title":
+        data["title"] = f"פרק {data['episode']}" if is_skip_word(text) else text
+        state["step"] = "media"
+        await reply(message, "🎞️ עכשיו שלח את קובץ הווידאו של הפרק.")
+    elif step == "confirm_series":
+        if text.casefold() in {"כן", "כן בטוח", "yes", "y"}:
+            CATALOG.delete_item(data["series_id"])
+            user_states.pop(user_id, None)
+            await reply(message, "✅ הסדרה וכל התוכן שלה נמחקו.")
+        elif text.casefold() in {"לא", "no", "n"}:
+            user_states.pop(user_id, None)
+            await reply(message, "👍 המחיקה בוטלה.")
+    elif step == "confirm_movie":
+        if text.casefold() in {"כן", "yes", "y"}:
+            CATALOG.delete_item(data["item_id"])
+            user_states.pop(user_id, None)
+            await reply(message, "✅ הסרט נמחק.")
+        elif text.casefold() in {"לא", "no", "n"}:
+            user_states.pop(user_id, None)
+            await reply(message, "👍 המחיקה בוטלה.")
+    elif step == "confirm_season":
+        if text.casefold() in {"כן", "yes", "y"}:
+            CATALOG.delete_season(data["series_id"], data["season"])
+            user_states.pop(user_id, None)
+            await reply(message, "✅ העונה נמחקה.")
+        elif text.casefold() in {"לא", "no", "n"}:
+            user_states.pop(user_id, None)
+            await reply(message, "👍 המחיקה בוטלה.")
+    elif step == "confirm_episode":
+        if text.casefold() in {"כן", "yes", "y"}:
+            CATALOG.delete_episode(data["series_id"], data["season"], data["episode"])
+            user_states.pop(user_id, None)
+            await reply(message, "✅ הפרק נמחק.")
+        elif text.casefold() in {"לא", "no", "n"}:
+            user_states.pop(user_id, None)
+            await reply(message, "👍 המחיקה בוטלה.")
+    else:
+        await reply(message, "❓ לא הבנתי. כתוב /cancel כדי להתחיל מחדש.")
+
+
+@bot_client.on_message((filters.private | filters.group | filters.channel) & filters.text, group=1)  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
+async def text_router(client: Client, message: Message):
+    if await reject_unauthorized(message):
+        return
+    text = (message.text or "").strip()
+    user_id = message.from_user.id if message.from_user else 0
+    if text.startswith("/"):
+        command = text.split()[0].split("@")[0].lower()
+        commands = {
+            "/add_movie": "movie", "/add_series": "series", "/add_episode": "episode",
+            "/edit_movie": "edit_movie", "/edit_series": "edit_series", "/remove_movie": "remove_movie",
+            "/remove_series": "remove_series",
+            "/remove_season": "remove_season", "/remove_episode": "remove_episode",
+        }
+        if command == "/cancel":
+            user_states.pop(user_id, None)
+            await reply(message, "✅ בוטל.")
+        elif command in commands:
+            await start_action(message, commands[command])
+        elif command == "/list":
+            await show_list(message)
+        elif command == "/report":
+            await show_report(message)
+        elif command == "/browse":
+            await show_browse_items(message)
+        elif command in {"/guide", "/help"}:
+            await show_guide(message)
+        elif command == "/about":
+            await show_about(message)
+        elif command in {"/management", "/manage"}:
+            await start_action(message, "management")
+        elif command == "/refresh":
+            user_states.pop(user_id, None)
+            await cast(Any, message).reply_text("🔄 התפריט רוענן.", reply_markup=MAIN_KEYBOARD)
+        return
+    if re.match(r"^(?:סדרה|series)\s*:?.+", text, flags=re.IGNORECASE):
+        await begin_season_upload(message, text)
+        return
+    if text in {"✅ סיום", "סיום"} and user_id in user_states:
+        state = user_states[user_id]
+        if state.get("step") == "batch_media":
+            uploaded = int(state["next_episode"]) - 1
+            user_states.pop(user_id, None)
+            await reply(message, f"✅ הסתיימה העלאת העונה. נשמרו {uploaded} פרקים.")
+        return
+    actions = {
+        "🎬 סרטים": "movies_menu", "📺 סדרות": "series_menu",
+        "➕ הוסף סרט": "movie", "➕ הוסף סדרה": "series",
+        "✏️ ערוך סרט": "edit_movie", "✏️ ערוך סדרה": "edit_series",
+        "🗑️ הסר סרט": "remove_movie", "🗑️ הסר סדרה": "remove_series",
+        "➕ הוסף פרק": "episode", "🗑️ הסר עונה": "remove_season",
+        "🗑️ הסר פרק": "remove_episode", "📚 רשימה": "list",
+        "🔗 קישור סטרימינג": "browse", "📊 דוח": "report", "📖 מדריך": "guide",
+        "ℹ️ אודות": "about",
+        "🛠️ ניהול": "management",
+        "➕ הוסף מנהל": "add_admin", "➖ הסר מנהל": "remove_admin",
+        "✅ אשר משתמש": "add_user", "🗑️ הסר משתמש": "remove_user",
+        "✅ אשר קבוצה": "add_group", "✅ אשר ערוץ": "add_channel",
+        "🗑️ הסר צ׳אט": "remove_chat", "📋 רשימות ניהול": "management_list",
+    }
+    if text in {"⬅️ חזרה", "🔄 רענן"}:
+        user_states.pop(user_id, None)
+        await cast(Any, message).reply_text("🔄 התפריט רוענן.", reply_markup=MAIN_KEYBOARD)
+    elif text == "❌ ביטול":
+        user_states.pop(user_id, None)
+        await cast(Any, message).reply_text("✅ בוטל.", reply_markup=MAIN_KEYBOARD)
+    elif text in actions:
+        action = actions[text]
+        if action == "movies_menu":
+            await show_section_menu(message, "movies")
+        elif action == "series_menu":
+            await show_section_menu(message, "series")
+        elif action == "season_upload_help":
+            await reply(message, "📦 כתוב למשל: `סדרה: פאודה עונה 1` ואז שלח את הקבצים לפי הסדר.", UPLOAD_SEASON_KEYBOARD)
+        else:
+            await start_action(message, action)
+    elif user_id in user_states:
+        await handle_state(message, user_states[user_id], text)
+    else:
+        results = CATALOG.search(text)
+        if results:
+            await reply(message, "🔎 מצאתי:\n" + "\n".join(
+                f"{'🎬' if item['kind'] == 'movie' else '📺'} {item['title']} · #{item['id']}"
+                for item in results[:10]
+            ))
+        else:
+            await reply(message, "💬 לא מצאתי התאמה בקטלוג. נסה שם אחר או לחץ על 📖 מדריך.")
+
+# ── Keep-alive ────────────────────────────────────────────────────────────────
+
+async def send_heartbeat(reason: str) -> None:
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{BASE_URL}/ping", timeout=10)
+            response.raise_for_status()
+        log.info("Heartbeat sent ✅ reason=%s", reason)
+    except Exception as error:
+        log.warning("Heartbeat failed (%s): %s", reason, error)
+
+
+async def keep_alive():
+    await asyncio.sleep(15)
+    while True:
+        await send_heartbeat("periodic")
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+
+if __name__ == "__main__":
+    uvicorn.run("main:api", host="0.0.0.0", port=PORT, log_level="info")

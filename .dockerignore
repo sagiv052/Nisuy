@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.venv311/
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+.git/
+.vscode/
+tests/
+README.md
+UPGRADES.md
+PLAYBACK.md
+ANDROID_API.md
