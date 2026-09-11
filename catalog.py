@@ -321,6 +321,11 @@ class Catalog:
             "episodes": episodes, "uploads": uploads,
         }
 
+    def checkpoint(self) -> None:
+        """Flush the WAL into the main SQLite file before a remote snapshot."""
+        with self._connect() as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def add_admin(self, user_id: int) -> None:
         with self._connect() as connection:
             connection.execute(

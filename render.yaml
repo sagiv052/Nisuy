@@ -16,5 +16,11 @@ services:
       - key: TMDB_API_KEY
         sync: false
       - key: CATALOG_DB
-        value: /tmp/catalog.db
+        value: /var/data/catalog.db
+      - key: CLOUDINARY_URL
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: telegram-stream-bot
+      - key: CATALOG_SYNC_INTERVAL
+        value: "60"
       # BASE_URL לא חובה — הקוד מגלה אותו אוטומטית מ-RENDER_EXTERNAL_URL.

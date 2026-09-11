@@ -6,7 +6,7 @@ from pathlib import Path
 asyncio.set_event_loop(asyncio.new_event_loop())
 
 from catalog import Catalog
-from main import parse_media_caption
+from main import parse_cloudinary_config, parse_media_caption
 from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
 from tmdb import transliterate_hebrew
 
@@ -57,6 +57,12 @@ class StreamUtilsTests(unittest.TestCase):
         self.assertEqual(metadata["year"], 2022)
         summary = metadata["summary"] if metadata.get("summary") else ""
         self.assertIn("הלחץ על המשפחה גובר", summary)
+
+    def test_parse_cloudinary_config(self):
+        config = parse_cloudinary_config("cloudinary://123456789:test-api-secret@demo-cloud")
+        self.assertEqual(config["cloud_name"], "demo-cloud")
+        self.assertEqual(config["api_key"], "123456789")
+        self.assertEqual(config["api_secret"], "test-api-secret")
 
 
 class CatalogTests(unittest.TestCase):

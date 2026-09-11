@@ -25,6 +25,7 @@ import json
 import logging
 import httpx
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, AsyncIterator, Optional, cast
@@ -40,6 +41,7 @@ from pyrogram.errors import FloodWait
 import uvicorn
 
 from catalog import Catalog
+from cloudinary_storage import CloudinaryStorage
 from memory_cache import ChunkMemoryCache
 from tmdb import TMDBClient
 from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
@@ -48,6 +50,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 load_dotenv()
+
+
+def parse_cloudinary_config(cloudinary_url: str) -> dict[str, str]:
+    url = (cloudinary_url or "").strip()
+    if not url:
+        raise ValueError("CLOUDINARY_URL is empty")
+
+    parsed = urlparse(url)
+    if parsed.scheme != "cloudinary":
+        raise ValueError("CLOUDINARY_URL must use the cloudinary:// scheme")
+    if not parsed.username or not parsed.password or not parsed.hostname:
+        raise ValueError(
+            "CLOUDINARY_URL must be in the format cloudinary://<api_key>:<api_secret>@<cloud_name>"
+        )
+
+    return {
+        "api_key": parsed.username,
+        "api_secret": parsed.password,
+        "cloud_name": parsed.hostname,
+    }
+
 
 # ── בדיקת משתני סביבה ──────────────────────────────────────────────────────
 # SESSION_STRING, API_ID ו-API_HASH לא נדרשים מהמשתמש.
@@ -65,6 +88,15 @@ if _missing:
 API_ID    = int(os.environ.get("API_ID", DEFAULT_API_ID))
 API_HASH  = os.environ.get("API_HASH", DEFAULT_API_HASH)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+CLOUDINARY_URL = os.environ.get("CLOUDINARY_URL", "").strip()
+if not CLOUDINARY_URL:
+    cloudinary_key = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+    cloudinary_secret = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+    cloudinary_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+    if cloudinary_key and cloudinary_secret and cloudinary_name:
+        CLOUDINARY_URL = f"cloudinary://{cloudinary_key}:{cloudinary_secret}@{cloudinary_name}"
+CLOUDINARY = parse_cloudinary_config(CLOUDINARY_URL) if CLOUDINARY_URL else None
+CLOUDINARY_STORAGE = CloudinaryStorage()
 PORT      = int(os.environ.get("PORT", 8000))
 KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
 LEAVE_UNAPPROVED_CHATS = os.environ.get("LEAVE_UNAPPROVED_CHATS", "1").strip().lower() in {
@@ -88,6 +120,17 @@ stats: dict[str, Any] = {
 
 def _catalog_database_path() -> str:
     configured_path = Path(os.environ.get("CATALOG_DB", "catalog.db"))
+
+    persistent_path = Path("/var/data/catalog.db")
+    if configured_path in {Path("catalog.db"), Path("/tmp/catalog.db")}:
+        try:
+            persistent_path.parent.mkdir(parents=True, exist_ok=True)
+            if os.access(persistent_path.parent, os.W_OK):
+                log.info("Using persistent catalog storage at %s", persistent_path)
+                return str(persistent_path)
+        except OSError as error:
+            log.warning("Persistent catalog path %s is unavailable (%s); falling back to %s", persistent_path, error, configured_path)
+
     try:
         configured_path.parent.mkdir(parents=True, exist_ok=True)
         if not os.access(configured_path.parent, os.W_OK):
@@ -99,7 +142,10 @@ def _catalog_database_path() -> str:
         return str(fallback_path)
 
 
-CATALOG = Catalog(_catalog_database_path())
+CATALOG_DB_PATH = _catalog_database_path()
+if CLOUDINARY_STORAGE.restore_catalog(CATALOG_DB_PATH):
+    log.info("Using restored Cloudinary catalog at %s", CATALOG_DB_PATH)
+CATALOG = Catalog(CATALOG_DB_PATH)
 TMDB = TMDBClient(
     os.environ.get("TMDB_READ_ACCESS_TOKEN", ""),
     os.environ.get("TMDB_API_KEY", ""),
@@ -208,13 +254,35 @@ async def enforce_chat_allowlist(client: Client, message: Message) -> None:
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     await bot_client.start()
     keep_alive_task = asyncio.create_task(keep_alive())
+    catalog_sync_task = asyncio.create_task(catalog_sync_loop())
     log.info("All systems ready ✅ BASE_URL=%s", BASE_URL)
     try:
         yield
     finally:
+        catalog_sync_task.cancel()
+        await sync_catalog_snapshot()
         keep_alive_task.cancel()
         await send_heartbeat("shutdown")
         await bot_client.stop()
+
+
+async def sync_catalog_snapshot() -> None:
+    if not CLOUDINARY_STORAGE.enabled:
+        return
+    try:
+        CATALOG.checkpoint()
+        synced = await asyncio.to_thread(CLOUDINARY_STORAGE.sync_catalog, CATALOG_DB_PATH)
+        if synced:
+            log.info("Catalog snapshot synchronized to Cloudinary")
+    except Exception:
+        log.exception("Catalog snapshot synchronization failed")
+
+
+async def catalog_sync_loop() -> None:
+    interval = max(30, int(os.environ.get("CATALOG_SYNC_INTERVAL", "60")))
+    while True:
+        await asyncio.sleep(interval)
+        await sync_catalog_snapshot()
 
 
 api = FastAPI(title="Telegram Stream Server", lifespan=lifespan)
@@ -644,9 +712,18 @@ async def handle_media(client: Client, message: Message):
         file_size = getattr(media, "file_size", 0)
         size_mb   = round(file_size / 1024 / 1024, 1)
 
-        # אין יותר copy/forward — מזרימים ישירות מההודעה המקורית
-        # שבה הבוט עצמו קיבל את הקובץ (message.chat.id / message.id).
-        stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
+        # Upload a durable copy when Cloudinary is configured. If it fails,
+        # keep the existing Telegram MTProto stream as a safe fallback.
+        telegram_stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
+        cloudinary_result = await CLOUDINARY_STORAGE.upload_downloaded_media(
+            client,
+            message,
+            chat_id=int(message.chat.id),
+            message_id=int(message.id),
+            file_name=file_name,
+            mime_type=getattr(media, "mime_type", ""),
+        )
+        stream_url = CLOUDINARY_STORAGE.storage_url(cloudinary_result) or telegram_stream_url
 
         upload_id = CATALOG.save_upload(
             file_name, file_size, getattr(media, "mime_type", ""), stream_url,
