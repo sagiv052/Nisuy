@@ -1,8 +1,12 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 
+asyncio.set_event_loop(asyncio.new_event_loop())
+
 from catalog import Catalog
+from main import parse_media_caption
 from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
 from tmdb import transliterate_hebrew
 
@@ -28,6 +32,31 @@ class StreamUtilsTests(unittest.TestCase):
 
     def test_hebrew_title_transliteration_fallback(self):
         self.assertEqual(transliterate_hebrew("פאודה"), "fauda")
+
+    def test_parse_media_caption_extracts_episode_summary_and_genre(self):
+        caption = (
+            "חיים של קוקו - עונה 1 פרק 2\n"
+            "זאנר: סדרה ישראלית | תרגום מובנה 🇮🇱\n"
+            "שנת יציאה: 2022\n"
+            "איכות 1080p WEB-DL x265 ❤\n"
+            "תקציר:\n"
+            "> הלחץ על המשפחה גובר. מטי לוקחת את גד ואלה לעורך דין\n"
+            "**הועלה וקודד ע\"י אחלה בנאדם\n"
+            "עבור הקרטל בטלגרם** 👍"
+        )
+
+        metadata = parse_media_caption(caption)
+
+        self.assertIsNotNone(metadata)
+        metadata = metadata if metadata is not None else {}
+        self.assertEqual(metadata["kind"], "episode")
+        self.assertEqual(metadata["season"], 1)
+        self.assertEqual(metadata["episode"], 2)
+        self.assertEqual(metadata["quality"], "1080p WEB-DL x265")
+        self.assertEqual(metadata["genre"], "סדרה ישראלית")
+        self.assertEqual(metadata["year"], 2022)
+        summary = metadata["summary"] if metadata.get("summary") else ""
+        self.assertIn("הלחץ על המשפחה גובר", summary)
 
 
 class CatalogTests(unittest.TestCase):

@@ -131,20 +131,20 @@ chunk_cache = ChunkMemoryCache(STREAM_CACHE_MB * 1024 * 1024, STREAM_CACHE_TTL)
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🎬 סרטים", "📺 סדרות"],
-        ["📚 רשימה", "🔗 קישור סטרימינג"],
+        ["📚 רשימה"],
         ["📊 דוח", "📖 מדריך", "ℹ️ אודות"],
         ["🛠️ ניהול"],
-        ["❌ ביטול"],
+        ["⬅️ אחורה"],
     ],
     resize_keyboard=True,
 )
 MOVIES_KEYBOARD = ReplyKeyboardMarkup(
-    [["➕ הוסף סרט", "✏️ ערוך סרט"], ["🗑️ הסר סרט"], ["⬅️ חזרה"]],
+    [["🎬 צפה בסרט", "➕ הוסף סרט", "✏️ ערוך סרט"], ["🗑️ הסר סרט"], ["⬅️ חזרה"]],
     resize_keyboard=True,
 )
 SERIES_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["➕ הוסף סדרה", "✏️ ערוך סדרה"],
+        ["📺 צפה בסדרה", "➕ הוסף סדרה", "✏️ ערוך סדרה"],
         ["🗑️ הסר סדרה", "➕ הוסף פרק"],
         ["🗑️ הסר עונה", "🗑️ הסר פרק"],
         ["⬅️ חזרה"],
@@ -152,15 +152,19 @@ SERIES_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 UPLOAD_SEASON_KEYBOARD = ReplyKeyboardMarkup(
-    [["✅ סיום"], ["🔄 רענן", "❌ ביטול"]],
+    [["✅ סיום"], ["🔄 רענן", "⬅️ אחורה"]],
     resize_keyboard=True,
 )
 OPTIONAL_FIELD_KEYBOARD = ReplyKeyboardMarkup(
-    [["⏭️ דלג"], ["❌ ביטול"]],
+    [["⏭️ דלג"], ["⬅️ אחורה"]],
+    resize_keyboard=True,
+)
+WATCH_KEYBOARD = ReplyKeyboardMarkup(
+    [["▶️ צפה עכשיו"], ["⬅️ אחורה"]],
     resize_keyboard=True,
 )
 EDIT_FIELD_KEYBOARD = ReplyKeyboardMarkup(
-    [["✏️ שם", "📝 תקציר"], ["📅 שנת יציאה", "🖼️ פוסטר"], ["❌ ביטול"]],
+    [["✏️ שם", "📝 תקציר"], ["📅 שנת יציאה", "🖼️ פוסטר"], ["⬅️ אחורה"]],
     resize_keyboard=True,
 )
 MANAGEMENT_KEYBOARD = ReplyKeyboardMarkup(
@@ -627,7 +631,12 @@ async def handle_media(client: Client, message: Message):
     if await reject_unauthorized(message):
         return
     stats["files_processed"] += 1
-    wait_msg: Message = await cast(Any, message).reply_text("⏳ מעבד...")
+    user_id = message.from_user.id if message.from_user else 0
+    state = user_states.get(user_id)
+    is_batch_upload = bool(state and state.get("step") == "batch_media")
+    wait_msg: Optional[Message] = None
+    if not is_batch_upload:
+        wait_msg = await cast(Any, message).reply_text("⏳ מעבד...")
 
     try:
         media     = message.video or message.audio or message.document or message.video_note
@@ -639,25 +648,32 @@ async def handle_media(client: Client, message: Message):
         # שבה הבוט עצמו קיבל את הקובץ (message.chat.id / message.id).
         stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
 
-        user_id = message.from_user.id if message.from_user else 0
-        state = user_states.get(user_id)
         upload_id = CATALOG.save_upload(
             file_name, file_size, getattr(media, "mime_type", ""), stream_url,
             message.chat.id, message.id,
         )
         if state and state.get("step") == "batch_media":
             episode_number = int(state["next_episode"])
-            episode_id = CATALOG.add_episode(
-                int(state["series_id"]), int(state["season"]), episode_number,
-                f"פרק {episode_number}", stream_url,
-            )
-            CATALOG.attach_upload(upload_id, episode_id)
+            try:
+                episode_id = CATALOG.add_episode(
+                    int(state["series_id"]), int(state["season"]), episode_number,
+                    f"פרק {episode_number}", stream_url,
+                )
+                CATALOG.attach_upload(upload_id, episode_id)
+                state["uploaded"] = int(state.get("uploaded", 0)) + 1
+            except Exception:
+                state["failed"] = int(state.get("failed", 0)) + 1
+                state.setdefault("failed_episodes", []).append(
+                    (int(state["season"]), episode_number)
+                )
+                log.exception(
+                    "Failed to save season %s episode %s",
+                    state["season"], episode_number,
+                )
             state["next_episode"] = episode_number + 1
-            await wait_msg.edit_text(
-                f"✅ נוסף עונה {state['season']} פרק {episode_number}.\n"
-                "שלח את הקובץ הבא או לחץ ✅ סיום."
-            )
             return
+        if wait_msg is None:
+            raise RuntimeError("Upload status message was not created")
         if state and state.get("step") == "media":
             data = state["data"]
             if state["flow"] == "movie":
@@ -736,7 +752,19 @@ async def handle_media(client: Client, message: Message):
 
     except Exception as e:
         log.exception("Error handling media")
-        await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
+        if is_batch_upload and state:
+            episode_number = int(state["next_episode"])
+            state["failed"] = int(state.get("failed", 0)) + 1
+            state.setdefault("failed_episodes", []).append(
+                (int(state["season"]), episode_number)
+            )
+            state["next_episode"] = episode_number + 1
+            log.error(
+                "Failed to process season %s episode %s: %s",
+                state["season"], episode_number, e,
+            )
+        elif wait_msg is not None:
+            await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
 
 
 @bot_client.on_message((filters.private | filters.group | filters.channel) & filters.command("start"))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
@@ -851,16 +879,49 @@ def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
     quality = ""
     genre = ""
     poster_url = ""
+    year = None
+
+    def sanitize_genre(value: str) -> str:
+        cleaned = value.strip()
+        parts: list[str] = []
+        for part in re.split(r"\s*\|\s*", cleaned):
+            stripped = part.strip(" -:;.,")
+            if not stripped:
+                continue
+            lowered = stripped.casefold()
+            if lowered.startswith((
+                "תרגום",
+                "מדובב",
+                "דובב",
+                "דיבוב",
+                "כתוביות",
+                "subtitle",
+                "sub",
+                "dub",
+                "translated",
+                "voice",
+                "audio",
+            )):
+                continue
+            parts.append(stripped)
+        if parts:
+            return " | ".join(parts)
+        return cleaned
+
     for line in lines:
         quality_match = re.match(r"(?:איכות|quality)\s*:?\s*(.+)$", line, flags=re.IGNORECASE)
         if quality_match:
             quality = quality_match.group(1).strip()
+            quality = re.sub(r"\s*[❤★✦☆]+\s*$", "", quality).strip()
         genre_match = re.match(r"(?:ז['׳]?אנר|genre)\s*:?\s*(.+)$", line, flags=re.IGNORECASE)
         if genre_match:
-            genre = genre_match.group(1).strip()
+            genre = sanitize_genre(genre_match.group(1).strip())
         poster_match = re.match(r"(?:פוסטר|poster)\s*:?\s*(https?://\S+)", line, flags=re.IGNORECASE)
         if poster_match:
             poster_url = poster_match.group(1).strip()
+        year_match = re.search(r"(?:שנת\s+יציאה|release\s+year|year)\s*:?\s*(\d{4})\b", line, flags=re.IGNORECASE)
+        if year_match:
+            year = int(year_match.group(1))
 
     ignored_prefixes = (
         "תרגום", "איכות", "ז'אנר", "זאנר", "תקציר", "נקרע",
@@ -872,33 +933,16 @@ def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
         r"^(?:series\s*:\s*)?(.+?)\s+season\s*(\d+)\s+(?:episode|ep)\s*(\d+)",
         r"^(?:series\s*:\s*)?(.+?)\s+s(\d{1,2})\s*e(\d{1,2})",
     ]
-    for line in lines[:3]:
-        for pattern in episode_patterns:
-            match = re.match(pattern, line, flags=re.IGNORECASE)
-            if match:
-                title_candidates = [match.group(1).strip(" :-")]
-                for alternate_line in lines[1:3]:
-                    if (
-                        re.search(r"[A-Za-z]", alternate_line)
-                        and not alternate_line.casefold().startswith(ignored_prefixes)
-                    ):
-                        title_candidates.append(alternate_line)
-                return {
-                    "kind": "episode",
-                    "title_candidates": title_candidates,
-                    "season": int(match.group(2)),
-                    "episode": int(match.group(3)),
-                    "quality": quality,
-                    "genre": genre,
-                }
-
     title_lines = [line for line in lines if not line.casefold().startswith(ignored_prefixes)]
     if not title_lines:
         return None
     title_candidates = [re.sub(r"\b(?:19|20)\d{2}\b", "", title_lines[0]).strip(" :-")]
     if len(title_lines) > 1 and re.search(r"[A-Za-z]", title_lines[1]):
         title_candidates.append(title_lines[1])
-    year_match = re.search(r"\b((?:19|20)\d{2})\b", lines[0])
+    if year is None:
+        year_match = re.search(r"\b((?:19|20)\d{2})\b", lines[0])
+        if year_match:
+            year = int(year_match.group(1))
     summary = ""
     for index, line in enumerate(lines):
         if line.casefold().startswith(("תקציר", "summary")):
@@ -910,10 +954,60 @@ def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
             summary = " ".join(summary_parts).strip()
             summary = re.split(r"\s+(?:הועלה|עבור|קרדיט|מקודד)\b", summary, maxsplit=1)[0].strip()
             break
+    if not genre:
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lowered = stripped.casefold()
+            if lowered.startswith(ignored_prefixes) or lowered.startswith(("איכות", "quality", "ז'אנר", "זאנר", "genre")):
+                continue
+            if "|" in stripped:
+                genre = stripped
+                break
+            if re.match(r"^(?:סדרה|סרט|series|movie)\s+.+$", stripped, flags=re.IGNORECASE):
+                genre = stripped
+                break
+
+    episode_match = None
+    season_number = None
+    episode_number = None
+    for line in lines[:3]:
+        for pattern_index, pattern in enumerate(episode_patterns):
+            match = re.match(pattern, line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            episode_match = match
+            season_number = int(match.group(2)) if pattern_index < 2 else int(match.group(1))
+            episode_number = int(match.group(3)) if pattern_index < 2 else int(match.group(2))
+            break
+        if episode_match:
+            break
+
+    if episode_match:
+        title_candidates = [episode_match.group(1).strip(" :-")]
+        for alternate_line in lines[1:3]:
+            if (
+                re.search(r"[A-Za-z]", alternate_line)
+                and not alternate_line.casefold().startswith(ignored_prefixes)
+            ):
+                title_candidates.append(alternate_line)
+        return {
+            "kind": "episode",
+            "title_candidates": [candidate for candidate in title_candidates if candidate],
+            "season": season_number,
+            "episode": episode_number,
+            "quality": quality,
+            "genre": genre,
+            "summary": summary,
+            "year": year,
+            "poster_url": poster_url,
+        }
+
     return {
         "kind": "movie",
         "title_candidates": [candidate for candidate in title_candidates if candidate],
-        "year": int(year_match.group(1)) if year_match else None,
+        "year": year,
         "quality": quality,
         "genre": genre,
         "summary": summary,
@@ -1079,10 +1173,11 @@ async def show_report(message: Message) -> None:
     await reply(message, "\n".join(lines))
 
 
-async def show_browse_items(message: Message) -> None:
-    items = CATALOG.list_items()
+async def show_browse_items(message: Message, kind: Optional[str] = None) -> None:
+    items = CATALOG.list_items(kind)
     if not items:
-        await reply(message, "📚 הקטלוג עדיין ריק.")
+        label = "סרטים" if kind == "movie" else "סדרות" if kind == "series" else "פריטים"
+        await reply(message, f"📚 עדיין אין {label} בקטלוג.")
         return
     user_id = message.from_user.id if message.from_user else 0
     user_states[user_id] = {
@@ -1093,6 +1188,31 @@ async def show_browse_items(message: Message) -> None:
         icon = "🎬" if item["kind"] == "movie" else "📺"
         lines.append(f"{index}. {icon} {item['title']}")
     await reply(message, "\n".join(lines))
+
+
+async def show_item_preview(message: Message, item: dict[str, Any]) -> None:
+    poster = item.get("poster_url") or ""
+    title = item["title"]
+    summary = item.get("summary") or ""
+    year = item.get("release_year")
+    genre = item.get("genre") or "אין"
+
+    lines = [f"📦 **{title}**", ""]
+    if year:
+        lines.append(f"📅 שנת יציאה: {year}")
+    lines.append(f"🎭 זאנר: {genre}")
+    if summary:
+        lines.append("")
+        lines.append(f"📝 תקציר:\n{summary}")
+
+    if poster:
+        try:
+            await cast(Any, message).reply_photo(poster, caption="\n".join(lines), reply_markup=WATCH_KEYBOARD)
+            return
+        except Exception as error:
+            log.warning("Could not send poster for %s: %s", title, error)
+
+    await reply(message, "\n".join(lines), WATCH_KEYBOARD)
 
 
 async def show_section_menu(message: Message, section: str) -> None:
@@ -1126,7 +1246,7 @@ async def show_guide(message: Message) -> None:
         "לאחר בחירת העונה שלח את הקבצים לפי הסדר, מהפרק הראשון ועד האחרון.\n"
         "בסיום לחץ על ✅ **סיום**.\n\n"
         "🔗 **צפייה וסטרימינג**\n"
-        "לחץ על **קישור סטרימינג** או כתוב `/browse`.\n"
+        "כתוב `/browse` כדי לפתוח קישורי סטרימינג.\n"
         "בחר סרט, או סדרה → עונה → פרק.\n\n"
         "📊 **בדיקת קטלוג**\n"
         "לחץ על **דוח** או כתוב `/report` כדי למצוא כפילויות ופרקים חסרים.\n\n"
@@ -1259,6 +1379,23 @@ async def start_action(message: Message, action: str) -> None:
         await reply(message, "🔒 הפעולה הזו זמינה למנהלים בלבד.")
         return
     user_id = message.from_user.id if message.from_user else 0
+    if action == "edit_series":
+        series_items = CATALOG.list_items("series")
+        if not series_items:
+            await reply(message, "📺 עדיין אין סדרות בקטלוג.")
+            return
+        user_states[user_id] = {
+            "flow": "edit_series",
+            "step": "series_choice",
+            "data": {"series_options": series_items},
+        }
+        lines = ["✏️ איזו סדרה לערוך? שלח את המספר:", ""]
+        lines.extend(
+            f"{index}. 📺 {series['title']}"
+            for index, series in enumerate(series_items, start=1)
+        )
+        await reply(message, "\n".join(lines))
+        return
     if action in {"movie", "series", "episode", "edit", "edit_movie", "edit_series", "remove_movie", "remove_series", "remove_season", "remove_episode"}:
         begin_flow(user_id, action)
         prompts = {
@@ -1327,6 +1464,9 @@ async def begin_season_upload(message: Message, text: str) -> None:
         "series_title": series["title"],
         "season": season_number,
         "next_episode": 1,
+        "uploaded": 0,
+        "failed": 0,
+        "failed_episodes": [],
     }
     await reply(
         message,
@@ -1423,6 +1563,18 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
 
     data = state["data"]
 
+    if step == "series_choice":
+        options = data.get("series_options", [])
+        if not text.isdigit() or not 1 <= int(text) <= len(options):
+            await reply(message, "❓ שלח מספר מהרשימה כדי לבחור סדרה.")
+            return
+        selected = options[int(text) - 1]
+        data["item_id"] = int(selected["id"])
+        data["kind"] = "series"
+        state["step"] = "edit_field"
+        await reply(message, f"✏️ בחר מה לערוך בסדרה **{selected['title']}**:", EDIT_FIELD_KEYBOARD)
+        return
+
     if step == "unlabeled_series":
         series = find_item(text, "series")
         if not series:
@@ -1466,11 +1618,14 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
     if step == "browse_item":
         items = data["items"]
         if not text.isdigit() or not 1 <= int(text) <= len(items):
-            await reply(message, "❓ בחר מספר מהרשימה או לחץ ביטול.")
+            await reply(message, "❓ בחר מספר מהרשימה או לחץ אחורה.")
             return
         item = items[int(text) - 1]
+        data["watch_item_id"] = item["id"]
+        data["watch_kind"] = item["kind"]
         if item["kind"] == "movie":
-            await send_stream_link(message, item["title"], item["stream_url"])
+            await show_item_preview(message, item)
+            state["step"] = "browse_preview"
             return
         seasons = CATALOG.list_seasons(int(item["id"]))
         if not seasons:
@@ -1481,10 +1636,25 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
         data["series_title"] = item["title"]
         data["seasons"] = seasons
         state["step"] = "browse_season"
+        await show_item_preview(message, item)
         await reply(message, "\n".join(
             [f"📺 {item['title']} — בחר עונה לפי מספר:", ""]
             + [f"{index}. עונה {season['season_number']}" for index, season in enumerate(seasons, 1)]
         ))
+    elif step == "browse_preview":
+        if text == "▶️ צפה עכשיו":
+            item = CATALOG.get_item(int(data["watch_item_id"]))
+            if not item:
+                user_states.pop(user_id, None)
+                await reply(message, "❌ לא נמצא פריט לצפייה.")
+                return
+            await send_stream_link(message, item["title"], item["stream_url"])
+            return
+        if text in {"⬅️ חזרה", "⬅️ אחורה"}:
+            user_states.pop(user_id, None)
+            await show_browse_items(message)
+            return
+        await reply(message, "❓ בחר ▶️ צפה עכשיו או לחץ אחורה.", WATCH_KEYBOARD)
     elif step == "browse_season":
         seasons = data["seasons"]
         if not text.isdigit() or not 1 <= int(text) <= len(seasons):
@@ -1585,7 +1755,7 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
         lookup_kind = data.get("kind", "series")
         item = find_item(series_query, lookup_kind)
         if not item:
-            await reply(message, "❓ לא מצאתי סדרה כזו. נסה שוב או לחץ ביטול.")
+            await reply(message, "❓ לא מצאתי סדרה כזו. נסה שוב או לחץ אחורה.")
             return
         data["series_id"] = item["id"]
         data["series_title"] = item["title"]
@@ -1745,18 +1915,34 @@ async def text_router(client: Client, message: Message):
     if text in {"✅ סיום", "סיום"} and user_id in user_states:
         state = user_states[user_id]
         if state.get("step") == "batch_media":
-            uploaded = int(state["next_episode"]) - 1
+            uploaded = int(state.get("uploaded", 0))
+            failed = int(state.get("failed", 0))
+            total = uploaded + failed
+            lines = [
+                "📦 **סיכום העלאת העונה**",
+                "",
+                f"📥 התקבלו: {total}",
+                f"✅ נשמרו בהצלחה: {uploaded}",
+                f"❌ נכשלו: {failed}",
+            ]
+            if failed:
+                lines.extend(["", "⚠️ **פרקים שנכשלו:**"])
+                lines.extend(
+                    f"• עונה {season} פרק {episode}"
+                    for season, episode in state.get("failed_episodes", [])
+                )
             user_states.pop(user_id, None)
-            await reply(message, f"✅ הסתיימה העלאת העונה. נשמרו {uploaded} פרקים.")
+            await reply(message, "\n".join(lines))
         return
     actions = {
         "🎬 סרטים": "movies_menu", "📺 סדרות": "series_menu",
+        "🎬 צפה בסרט": "browse_movies", "📺 צפה בסדרה": "browse_series",
         "➕ הוסף סרט": "movie", "➕ הוסף סדרה": "series",
         "✏️ ערוך סרט": "edit_movie", "✏️ ערוך סדרה": "edit_series",
         "🗑️ הסר סרט": "remove_movie", "🗑️ הסר סדרה": "remove_series",
         "➕ הוסף פרק": "episode", "🗑️ הסר עונה": "remove_season",
         "🗑️ הסר פרק": "remove_episode", "📚 רשימה": "list",
-        "🔗 קישור סטרימינג": "browse", "📊 דוח": "report", "📖 מדריך": "guide",
+        "📊 דוח": "report", "📖 מדריך": "guide",
         "ℹ️ אודות": "about",
         "🛠️ ניהול": "management",
         "➕ הוסף מנהל": "add_admin", "➖ הסר מנהל": "remove_admin",
@@ -1776,6 +1962,10 @@ async def text_router(client: Client, message: Message):
             await show_section_menu(message, "movies")
         elif action == "series_menu":
             await show_section_menu(message, "series")
+        elif action == "browse_movies":
+            await show_browse_items(message, "movie")
+        elif action == "browse_series":
+            await show_browse_items(message, "series")
         elif action == "season_upload_help":
             await reply(message, "📦 כתוב למשל: `סדרה: פאודה עונה 1` ואז שלח את הקבצים לפי הסדר.", UPLOAD_SEASON_KEYBOARD)
         else:
