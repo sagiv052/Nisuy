@@ -31,8 +31,3 @@
 - לחלופין ב-Render אפשר להגדיר `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` ו-`CLOUDINARY_CLOUD_NAME`; הקוד מחבר אותם אוטומטית
 - `CLOUDINARY_FOLDER` — אופציונלי; ברירת מחדל `telegram-stream-bot`
 - `CATALOG_SYNC_INTERVAL` — אופציונלי; מרווח בשניות לסנכרון הקטלוג, ברירת מחדל `60`
-
-## הערות
-- קבצי מדיה חדשים נשמרים ב-Cloudinary כש-`CLOUDINARY_URL` מוגדר; במקרה של כשל ההעלאה הבוט ממשיך עם סטרימינג מטלגרם.
-- הקטלוג וההרשאות נשמרים בזמן הריצה ב-SQLite זמני, ומסונכרנים כ-snapshot ל-Cloudinary. בהפעלה מחדש ה-snapshot האחרון משוחזר אוטומטית.
-- אם מוגדר `ADMIN_USER_IDS`, רק מנהלים יכולים לשנות את הקטלוג.
