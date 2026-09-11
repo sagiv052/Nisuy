@@ -4,6 +4,11 @@ The adapter intentionally keeps credentials in environment variables and returns
 None on an upload failure so the bot can fall back to its Telegram stream URL.
 """
 
+# pyright: reportMissingTypeStubs=false
+# pyright: reportUnknownMemberType=false
+# pyright: reportUnknownVariableType=false
+# pyright: reportOptionalMemberAccess=false
+
 from __future__ import annotations
 
 import logging

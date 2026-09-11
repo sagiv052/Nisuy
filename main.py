@@ -43,7 +43,6 @@ import uvicorn
 from catalog import Catalog
 from cloudinary_storage import CloudinaryStorage
 from memory_cache import ChunkMemoryCache
-from tmdb import TMDBClient
 from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -88,14 +87,14 @@ if _missing:
 API_ID    = int(os.environ.get("API_ID", DEFAULT_API_ID))
 API_HASH  = os.environ.get("API_HASH", DEFAULT_API_HASH)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CLOUDINARY_URL = os.environ.get("CLOUDINARY_URL", "").strip()
-if not CLOUDINARY_URL:
+configured_cloudinary_url = os.environ.get("CLOUDINARY_URL", "").strip()
+if not configured_cloudinary_url:
     cloudinary_key = os.environ.get("CLOUDINARY_API_KEY", "").strip()
     cloudinary_secret = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
     cloudinary_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
     if cloudinary_key and cloudinary_secret and cloudinary_name:
-        CLOUDINARY_URL = f"cloudinary://{cloudinary_key}:{cloudinary_secret}@{cloudinary_name}"
-CLOUDINARY = parse_cloudinary_config(CLOUDINARY_URL) if CLOUDINARY_URL else None
+        configured_cloudinary_url = f"cloudinary://{cloudinary_key}:{cloudinary_secret}@{cloudinary_name}"
+CLOUDINARY = parse_cloudinary_config(configured_cloudinary_url) if configured_cloudinary_url else None
 CLOUDINARY_STORAGE = CloudinaryStorage()
 PORT      = int(os.environ.get("PORT", 8000))
 KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
@@ -146,10 +145,6 @@ CATALOG_DB_PATH = _catalog_database_path()
 if CLOUDINARY_STORAGE.restore_catalog(CATALOG_DB_PATH):
     log.info("Using restored Cloudinary catalog at %s", CATALOG_DB_PATH)
 CATALOG = Catalog(CATALOG_DB_PATH)
-TMDB = TMDBClient(
-    os.environ.get("TMDB_READ_ACCESS_TOKEN", ""),
-    os.environ.get("TMDB_API_KEY", ""),
-)
 OWNER_USER_ID = 5699704187
 CONFIGURED_ADMIN_USER_IDS = {
     int(value.strip())
@@ -163,6 +158,8 @@ CATALOG.add_admin(OWNER_USER_ID)
 CATALOG.add_user(OWNER_USER_ID, OWNER_USER_ID)
 ADMIN_USER_IDS = set(CATALOG.list_admins()) | {OWNER_USER_ID}
 user_states: dict[int, dict[str, Any]] = {}
+auto_batch_states: dict[int, dict[str, Any]] = {}
+auto_batch_tasks: dict[int, asyncio.Task[None]] = {}
 MESSAGE_CACHE_TTL = 60.0
 message_cache: dict[tuple[int, int], tuple[float, Message]] = {}
 message_cache_lock = asyncio.Lock()
@@ -701,7 +698,7 @@ async def handle_media(client: Client, message: Message):
     stats["files_processed"] += 1
     user_id = message.from_user.id if message.from_user else 0
     state = user_states.get(user_id)
-    is_batch_upload = bool(state and state.get("step") == "batch_media")
+    is_batch_upload = is_batch_upload_state(state)
     wait_msg: Optional[Message] = None
     if not is_batch_upload:
         wait_msg = await cast(Any, message).reply_text("⏳ מעבד...")
@@ -738,6 +735,20 @@ async def handle_media(client: Client, message: Message):
                 )
                 CATALOG.attach_upload(upload_id, episode_id)
                 state["uploaded"] = int(state.get("uploaded", 0)) + 1
+                state.setdefault("saved_items", []).append(
+                    {
+                        "kind": "episode",
+                        "title": f"{state.get('series_title', 'סדרה')} — עונה {state['season']} פרק {episode_number}",
+                        "series_title": state.get("series_title", "סדרה"),
+                        "season": int(state["season"]),
+                        "episode": episode_number,
+                        "stream_url": stream_url,
+                        "quality": "",
+                        "genre": "",
+                        "summary": "",
+                        "release_year": None,
+                    }
+                )
             except Exception:
                 state["failed"] = int(state.get("failed", 0)) + 1
                 state.setdefault("failed_episodes", []).append(
@@ -777,9 +788,47 @@ async def handle_media(client: Client, message: Message):
 
         parsed_caption = parse_media_caption(message.caption or "")
         if parsed_caption:
-            result = await auto_catalog_media(parsed_caption, stream_url, upload_id)
-            if result:
-                await wait_msg.edit_text(result)
+            try:
+                result_message, saved_item = await auto_catalog_media(parsed_caption, stream_url, upload_id)
+            except Exception:
+                if parsed_caption.get("kind") == "episode" and not is_batch_upload_state(state):
+                    batch_state = auto_batch_states.setdefault(
+                        user_id,
+                        {
+                            "uploaded": 0,
+                            "failed": 0,
+                            "failed_episodes": [],
+                            "saved_items": [],
+                            "last_message": message,
+                        },
+                    )
+                    batch_state["failed"] = int(batch_state.get("failed", 0)) + 1
+                    batch_state["failed_episodes"].append(
+                        (parsed_caption.get("season"), parsed_caption.get("episode"))
+                    )
+                    batch_state["last_message"] = message
+                    queue_auto_batch_summary(user_id, message)
+                    return
+                raise
+            if parsed_caption.get("kind") == "episode" and not is_batch_upload_state(state):
+                batch_state = auto_batch_states.setdefault(
+                    user_id,
+                    {
+                        "uploaded": 0,
+                        "failed": 0,
+                        "failed_episodes": [],
+                        "saved_items": [],
+                        "last_message": message,
+                    },
+                )
+                batch_state["uploaded"] = int(batch_state.get("uploaded", 0)) + 1
+                if saved_item:
+                    batch_state.setdefault("saved_items", []).append(saved_item)
+                batch_state["last_message"] = message
+                queue_auto_batch_summary(user_id, message)
+                return
+            if result_message:
+                await wait_msg.edit_text(result_message)
                 return
 
         partial = parse_partial_episode_reference(message.caption or "")
@@ -918,9 +967,100 @@ def is_skip_word(text: str) -> bool:
     return text.strip().casefold().replace("⏭️ ", "") in SKIP_WORDS
 
 
+def is_batch_upload_state(state: Optional[dict[str, Any]]) -> bool:
+    return bool(state and state.get("flow") == "batch_episode" and state.get("step") == "batch_media")
+
+
 def is_back_command(text: str) -> bool:
     normalized = text.strip().casefold()
     return normalized in {"⬅️ חזרה", "⬅️ אחורה", "חזרה", "אחורה", "back", "cancel"}
+
+
+def _format_saved_item_line(item: dict[str, Any]) -> str:
+    title = str(item.get("title") or "קובץ")
+    suffix_parts: list[str] = []
+    if item.get("season") is not None and item.get("episode") is not None:
+        suffix_parts.append(f"עונה {item['season']} פרק {item['episode']}")
+    if item.get("quality"):
+        suffix_parts.append(str(item.get("quality")))
+    if item.get("genre"):
+        suffix_parts.append(f"זאנר: {item['genre']}")
+    if item.get("release_year"):
+        suffix_parts.append(f"שנה: {item['release_year']}")
+    if item.get("summary"):
+        summary = re.sub(r"\s+", " ", str(item["summary"])).strip()
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
+        suffix_parts.append(f"תקציר: {summary}")
+    if item.get("stream_url"):
+        suffix_parts.append(f"🔗 {item['stream_url']}")
+
+    if suffix_parts:
+        return f"• {title} | {' | '.join(suffix_parts)}"
+    return f"• {title}"
+
+
+async def flush_auto_batch_summary(user_id: int) -> None:
+    try:
+        await asyncio.sleep(2.0)
+        state = auto_batch_states.pop(user_id, None)
+        if not state:
+            return
+
+        total = int(state.get("uploaded", 0)) + int(state.get("failed", 0))
+        if total <= 0:
+            return
+
+        lines = [
+            "📦 **סיכום קבצים אוטומטיים**",
+            "",
+            f"📥 התקבלו: {total}",
+            f"✅ נשמרו בהצלחה: {state.get('uploaded', 0)}",
+            f"❌ נכשלו: {state.get('failed', 0)}",
+        ]
+
+        saved_items = list(state.get("saved_items", []))
+        if saved_items:
+            lines.extend(["", "✅ **קבצים שנשמרו בקטלוג:**"])
+            preview_limit = 20
+            for item in saved_items[:preview_limit]:
+                lines.append(_format_saved_item_line(item))
+            if len(saved_items) > preview_limit:
+                lines.append(f"... ועוד {len(saved_items) - preview_limit} פריטים שנשמרו בקטלוג.")
+
+        if state.get("failed", 0):
+            lines.extend(["", "⚠️ **קבצים שנכשלו:**"])
+            lines.extend(
+                f"• עונה {season} פרק {episode}"
+                for season, episode in state.get("failed_episodes", [])
+            )
+
+        message = state.get("last_message")
+        if message is not None:
+            await reply(message, "\n".join(lines))
+    finally:
+        auto_batch_tasks.pop(user_id, None)
+
+
+def queue_auto_batch_summary(user_id: int, message: Message) -> None:
+    state = auto_batch_states.setdefault(
+        user_id,
+        {
+            "uploaded": 0,
+            "failed": 0,
+            "failed_episodes": [],
+            "saved_items": [],
+            "last_message": message,
+        },
+    )
+    state["last_message"] = message
+
+    existing_task = auto_batch_tasks.pop(user_id, None)
+    if existing_task is not None:
+        existing_task.cancel()
+
+    task = asyncio.create_task(flush_auto_batch_summary(user_id))
+    auto_batch_tasks[user_id] = task
 
 
 def parse_episode_reference(text: str) -> tuple[str, Optional[int], Optional[int]]:
@@ -1119,58 +1259,64 @@ async def auto_catalog_media(
     metadata: dict[str, Any],
     stream_url: str,
     upload_id: int,
-) -> Optional[str]:
+) -> tuple[str, dict[str, Any]]:
     candidates = metadata["title_candidates"]
     kind = metadata["kind"]
-    match: Optional[dict[str, Any]] = None
-    for candidate in candidates:
-        try:
-            matches = await TMDB.search(candidate, "series" if kind == "episode" else "movie")
-        except Exception as error:
-            log.warning("Automatic TMDB lookup failed: %s", error)
-            matches = []
-        if matches:
-            match = matches[0]
-            break
-
-    if match and not metadata.get("genre") and match.get("tmdb_id"):
-        try:
-            match = await TMDB.details(int(match["tmdb_id"]), "series" if kind == "episode" else "movie")
-        except Exception as error:
-            log.warning("TMDB details lookup failed: %s", error)
 
     if kind == "episode":
-        series_title = match["title"] if match else candidates[0]
+        series_title = candidates[0]
         series = find_item(series_title, "series")
         if not series:
             series = find_item(candidates[0], "series")
         if not series:
             series_id = CATALOG.add_item(
-                "series", series_title,
-                match["summary"] if match else "",
-                match["release_year"] if match else None,
-                match["poster_url"] if match else "",
+                "series",
+                series_title,
+                metadata.get("summary", ""),
+                metadata.get("year"),
+                metadata.get("poster_url", ""),
                 "",
-                match["backdrop_url"] if match else "",
-                match["rating"] if match else None,
-                match["tmdb_id"] if match else None,
-                metadata.get("genre", "") or (match.get("genre", "") if match else ""),
+                "",
+                None,
+                None,
+                metadata.get("quality", ""),
+                metadata.get("genre", ""),
             )
         else:
             series_id = int(series["id"])
         episode_id = CATALOG.add_episode(
-            series_id, metadata["season"], metadata["episode"],
-            f"פרק {metadata['episode']}", stream_url, metadata.get("quality", ""),
+            series_id,
+            metadata["season"],
+            metadata["episode"],
+            f"פרק {metadata['episode']}",
+            stream_url,
+            metadata.get("quality", ""),
         )
         CATALOG.attach_upload(upload_id, episode_id)
-        return f"📺 נשמר אוטומטית: {series_title}, עונה {metadata['season']} פרק {metadata['episode']} ✅"
+        saved_item: dict[str, Any] = {
+            "kind": "episode",
+            "title": f"{series_title} — עונה {metadata['season']} פרק {metadata['episode']}",
+            "series_title": series_title,
+            "season": metadata["season"],
+            "episode": metadata["episode"],
+            "stream_url": stream_url,
+            "quality": metadata.get("quality", ""),
+            "genre": metadata.get("genre", ""),
+            "summary": metadata.get("summary", ""),
+            "release_year": metadata.get("year"),
+            "item_id": episode_id,
+        }
+        return (
+            f"📺 נשמר אוטומטית: {series_title}, עונה {metadata['season']} פרק {metadata['episode']} ✅",
+            saved_item,
+        )
 
-    title = match["title"] if match else candidates[0]
-    tmdb_values = match or {}
-    summary = metadata.get("summary", "") or tmdb_values.get("summary", "")
-    release_year = metadata.get("year") or tmdb_values.get("release_year")
-    poster_url = metadata.get("poster_url", "") or tmdb_values.get("poster_url", "")
-    genre = metadata.get("genre", "") or tmdb_values.get("genre", "")
+    title = candidates[0]
+    summary = metadata.get("summary", "")
+    release_year = metadata.get("year")
+    poster_url = metadata.get("poster_url", "")
+    genre = metadata.get("genre", "")
+
     existing = find_item(title, "movie")
     if existing:
         item_id = int(existing["id"])
@@ -1188,15 +1334,30 @@ async def auto_catalog_media(
         CATALOG.update_item(item_id, **updates)
     else:
         item_id = CATALOG.add_item(
-            "movie", title, summary, release_year,
-            poster_url, stream_url,
-            tmdb_values.get("backdrop_url", ""), tmdb_values.get("rating"),
-            tmdb_values.get("tmdb_id"),
+            "movie",
+            title,
+            summary,
+            release_year,
+            poster_url,
+            stream_url,
+            "",
+            None,
+            None,
             metadata.get("quality", ""),
             genre,
         )
     CATALOG.attach_upload(upload_id, item_id)
-    return f"🎬 נשמר אוטומטית: {title} ✅"
+    saved_item: dict[str, Any] = {
+        "kind": "movie",
+        "title": title,
+        "stream_url": stream_url,
+        "quality": metadata.get("quality", ""),
+        "genre": genre,
+        "summary": summary,
+        "release_year": release_year,
+        "item_id": item_id,
+    }
+    return f"🎬 נשמר אוטומטית: {title} ✅", saved_item
 
 
 def begin_flow(user_id: int, flow: str) -> None:
@@ -1767,51 +1928,8 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
         )
     elif step == "title":
         data["title"] = text
-        if flow in {"movie", "series"} and TMDB.enabled:
-            try:
-                matches = await TMDB.search(text, flow)
-            except Exception as error:
-                log.warning("TMDB search failed: %s", error)
-                matches = []
-            if matches:
-                data["tmdb_results"] = matches
-                state["step"] = "tmdb_choice"
-                lines = ["🔎 מצאתי ב-TMDB. בחר מספר, או כתוב `דלג` להזנה ידנית:", ""]
-                for index, match in enumerate(matches, start=1):
-                    year = f" ({match['release_year']})" if match["release_year"] else ""
-                    lines.append(f"{index}. {match['title']}{year} ⭐ {match['rating'] or '-'}")
-                await reply(message, "\n".join(lines), OPTIONAL_FIELD_KEYBOARD)
-                return
         state["step"] = "summary"
         await reply(message, "📝 כתוב תקציר קצר, או כתוב `דלג` / לחץ על ⏭️ דלג.", OPTIONAL_FIELD_KEYBOARD)
-    elif step == "tmdb_choice":
-        matches = data.get("tmdb_results", [])
-        if is_skip_word(text):
-            data.pop("tmdb_results", None)
-            state["step"] = "summary"
-            await reply(message, "📝 כתוב תקציר קצר, או כתוב `דלג`.", OPTIONAL_FIELD_KEYBOARD)
-            return
-        if not text.isdigit() or not 1 <= int(text) <= len(matches):
-            await reply(message, "❓ בחר מספר מהרשימה, או כתוב `דלג`.", OPTIONAL_FIELD_KEYBOARD)
-            return
-        selected = matches[int(text) - 1]
-        data.update({
-            "title": selected["title"], "summary": selected["summary"],
-            "year": selected["release_year"], "poster_url": selected["poster_url"],
-            "backdrop_url": selected["backdrop_url"], "rating": selected["rating"],
-            "tmdb_id": selected["tmdb_id"],
-        })
-        data.pop("tmdb_results", None)
-        if flow == "series":
-            item_id = CATALOG.add_item(
-                "series", data["title"], data["summary"], data["year"],
-                data["poster_url"], "", data["backdrop_url"], data["rating"], data["tmdb_id"],
-            )
-            user_states.pop(user_id, None)
-            await reply(message, f"✅ הסדרה **{data['title']}** נוספה מ-TMDB (#{item_id}).")
-        else:
-            state["step"] = "media"
-            await reply(message, "✅ הפרטים מולאו מ-TMDB. עכשיו שלח את קובץ הווידאו של הסרט.")
     elif step == "summary":
         data["summary"] = "" if is_skip_word(text) else text
         state["step"] = "year"
@@ -1825,7 +1943,7 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
         if flow == "series":
             item_id = CATALOG.add_item(
                 "series", data["title"], data["summary"], data["year"], data["poster_url"],
-                "", data.get("backdrop_url", ""), data.get("rating"), data.get("tmdb_id"),
+                "", "", None, None,
             )
             user_states.pop(user_id, None)
             await reply(message, f"✅ הסדרה **{data['title']}** נוספה לקטלוג (#{item_id}).")
@@ -2008,7 +2126,7 @@ async def text_router(client: Client, message: Message):
         return
     if text in {"✅ סיום", "סיום"} and user_id in user_states:
         state = user_states[user_id]
-        if state.get("step") == "batch_media":
+        if is_batch_upload_state(state):
             uploaded = int(state.get("uploaded", 0))
             failed = int(state.get("failed", 0))
             total = uploaded + failed

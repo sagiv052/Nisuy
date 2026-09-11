@@ -8,7 +8,6 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 from catalog import Catalog
 from main import parse_cloudinary_config, parse_media_caption
 from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
-from tmdb import transliterate_hebrew
 
 
 class StreamUtilsTests(unittest.TestCase):
@@ -29,9 +28,6 @@ class StreamUtilsTests(unittest.TestCase):
         self.assertNotIn("\r", header)
         self.assertNotIn("\n", header)
         self.assertIn("filename*=UTF-8''", header)
-
-    def test_hebrew_title_transliteration_fallback(self):
-        self.assertEqual(transliterate_hebrew("פאודה"), "fauda")
 
     def test_parse_media_caption_extracts_episode_summary_and_genre(self):
         caption = (
