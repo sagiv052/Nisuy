@@ -1,8 +1,16 @@
+databases:
+  - name: telegram-catalog-db
+    databaseName: telegram_catalog
+    user: telegram_bot
+    plan: free
+    region: singapore
+
 services:
   - type: web
     name: telegram-stream-server
     env: docker
     plan: free
+    region: singapore
     healthCheckPath: /ping
     envVars:
       - key: BOT_TOKEN
@@ -15,8 +23,10 @@ services:
         sync: false
       - key: TMDB_API_KEY
         sync: false
-      - key: CATALOG_DB
-        value: /var/data/catalog.db
+      - key: DATABASE_URL
+        fromDatabase:
+          name: telegram-catalog-db
+          property: connectionString
       - key: CLOUDINARY_URL
         sync: false
       - key: CLOUDINARY_FOLDER

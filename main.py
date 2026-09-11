@@ -95,7 +95,8 @@ if not configured_cloudinary_url:
     if cloudinary_key and cloudinary_secret and cloudinary_name:
         configured_cloudinary_url = f"cloudinary://{cloudinary_key}:{cloudinary_secret}@{cloudinary_name}"
 CLOUDINARY = parse_cloudinary_config(configured_cloudinary_url) if configured_cloudinary_url else None
-CLOUDINARY_STORAGE = CloudinaryStorage()
+CLOUDINARY_STORAGE = CloudinaryStorage(configured_cloudinary_url)
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PORT      = int(os.environ.get("PORT", 8000))
 KEEP_ALIVE_INTERVAL = int(os.environ.get("KEEP_ALIVE_INTERVAL", 300))
 LEAVE_UNAPPROVED_CHATS = os.environ.get("LEAVE_UNAPPROVED_CHATS", "1").strip().lower() in {
@@ -142,9 +143,11 @@ def _catalog_database_path() -> str:
 
 
 CATALOG_DB_PATH = _catalog_database_path()
-if CLOUDINARY_STORAGE.restore_catalog(CATALOG_DB_PATH):
+if not DATABASE_URL and CLOUDINARY_STORAGE.restore_catalog(CATALOG_DB_PATH):
     log.info("Using restored Cloudinary catalog at %s", CATALOG_DB_PATH)
-CATALOG = Catalog(CATALOG_DB_PATH)
+CATALOG = Catalog(CATALOG_DB_PATH, database_url=DATABASE_URL)
+if CATALOG.is_postgres:
+    log.info("Using PostgreSQL catalog from DATABASE_URL")
 OWNER_USER_ID = 5699704187
 CONFIGURED_ADMIN_USER_IDS = {
     int(value.strip())
@@ -160,6 +163,10 @@ ADMIN_USER_IDS = set(CATALOG.list_admins()) | {OWNER_USER_ID}
 user_states: dict[int, dict[str, Any]] = {}
 auto_batch_states: dict[int, dict[str, Any]] = {}
 auto_batch_tasks: dict[int, asyncio.Task[None]] = {}
+auto_batch_locks: dict[int, asyncio.Lock] = {}
+batch_locks: dict[int, asyncio.Lock] = {}
+MAX_CONCURRENT_UPLOADS = min(4, max(1, int(os.environ.get("MAX_CONCURRENT_UPLOADS", "2"))))
+upload_slots = asyncio.Semaphore(MAX_CONCURRENT_UPLOADS)
 MESSAGE_CACHE_TTL = 60.0
 message_cache: dict[tuple[int, int], tuple[float, Message]] = {}
 message_cache_lock = asyncio.Lock()
@@ -264,7 +271,7 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
 
 
 async def sync_catalog_snapshot() -> None:
-    if not CLOUDINARY_STORAGE.enabled:
+    if CATALOG.is_postgres or not CLOUDINARY_STORAGE.enabled:
         return
     try:
         CATALOG.checkpoint()
@@ -699,6 +706,12 @@ async def handle_media(client: Client, message: Message):
     user_id = message.from_user.id if message.from_user else 0
     state = user_states.get(user_id)
     is_batch_upload = is_batch_upload_state(state)
+    batch_lock: Optional[asyncio.Lock] = None
+    if is_batch_upload:
+        batch_lock = batch_locks.setdefault(user_id, asyncio.Lock())
+        # Telegram can deliver several media updates concurrently. Serialize a
+        # user's explicit season upload so next_episode cannot be duplicated.
+        await batch_lock.acquire()
     wait_msg: Optional[Message] = None
     if not is_batch_upload:
         wait_msg = await cast(Any, message).reply_text("⏳ מעבד...")
@@ -712,14 +725,15 @@ async def handle_media(client: Client, message: Message):
         # Upload a durable copy when Cloudinary is configured. If it fails,
         # keep the existing Telegram MTProto stream as a safe fallback.
         telegram_stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
-        cloudinary_result = await CLOUDINARY_STORAGE.upload_downloaded_media(
-            client,
-            message,
-            chat_id=int(message.chat.id),
-            message_id=int(message.id),
-            file_name=file_name,
-            mime_type=getattr(media, "mime_type", ""),
-        )
+        async with upload_slots:
+            cloudinary_result = await CLOUDINARY_STORAGE.upload_downloaded_media(
+                client,
+                message,
+                chat_id=int(message.chat.id),
+                message_id=int(message.id),
+                file_name=file_name,
+                mime_type=getattr(media, "mime_type", ""),
+            )
         stream_url = CLOUDINARY_STORAGE.storage_url(cloudinary_result) or telegram_stream_url
 
         upload_id = CATALOG.save_upload(
@@ -786,8 +800,19 @@ async def handle_media(client: Client, message: Message):
             await wait_msg.edit_text(result)
             return
 
-        parsed_caption = parse_media_caption(message.caption or "")
+        # Captions are preferred, but common filenames such as
+        # "Fauda.S01E02.1080p.mkv" are also enough to classify a file. This
+        # lets users send mixed-series batches without manually captioning each
+        # item, as long as the filename contains the series and SxxEyy data.
+        metadata_text = message.caption or re.sub(
+            r"[._]+", " ", Path(file_name or "").stem
+        )
+        parsed_caption = parse_media_caption(metadata_text)
         if parsed_caption:
+            auto_batch_lock: Optional[asyncio.Lock] = None
+            if parsed_caption.get("kind") == "episode":
+                auto_batch_lock = auto_batch_locks.setdefault(user_id, asyncio.Lock())
+                await auto_batch_lock.acquire()
             try:
                 result_message, saved_item = await auto_catalog_media(parsed_caption, stream_url, upload_id)
             except Exception:
@@ -799,6 +824,7 @@ async def handle_media(client: Client, message: Message):
                             "failed": 0,
                             "failed_episodes": [],
                             "saved_items": [],
+                            "groups": {},
                             "last_message": message,
                         },
                     )
@@ -806,10 +832,15 @@ async def handle_media(client: Client, message: Message):
                     batch_state["failed_episodes"].append(
                         (parsed_caption.get("season"), parsed_caption.get("episode"))
                     )
+                    group = str(parsed_caption.get("title_candidates", ["לא ידוע"])[0])
+                    batch_state.setdefault("groups", {}).setdefault(group, {"uploaded": 0, "failed": 0})["failed"] += 1
                     batch_state["last_message"] = message
                     queue_auto_batch_summary(user_id, message)
                     return
                 raise
+            finally:
+                if auto_batch_lock is not None and auto_batch_lock.locked():
+                    auto_batch_lock.release()
             if parsed_caption.get("kind") == "episode" and not is_batch_upload_state(state):
                 batch_state = auto_batch_states.setdefault(
                     user_id,
@@ -818,10 +849,13 @@ async def handle_media(client: Client, message: Message):
                         "failed": 0,
                         "failed_episodes": [],
                         "saved_items": [],
+                        "groups": {},
                         "last_message": message,
                     },
                 )
                 batch_state["uploaded"] = int(batch_state.get("uploaded", 0)) + 1
+                group = str(parsed_caption.get("title_candidates", ["לא ידוע"])[0])
+                batch_state.setdefault("groups", {}).setdefault(group, {"uploaded": 0, "failed": 0})["uploaded"] += 1
                 if saved_item:
                     batch_state.setdefault("saved_items", []).append(saved_item)
                 batch_state["last_message"] = message
@@ -831,7 +865,7 @@ async def handle_media(client: Client, message: Message):
                 await wait_msg.edit_text(result_message)
                 return
 
-        partial = parse_partial_episode_reference(message.caption or "")
+        partial = parse_partial_episode_reference(metadata_text)
         chat_type = getattr(message.chat, "type", "")
         is_channel = (
             getattr(chat_type, "value", chat_type) == "channel"
@@ -891,6 +925,9 @@ async def handle_media(client: Client, message: Message):
             )
         elif wait_msg is not None:
             await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
+    finally:
+        if batch_lock is not None and batch_lock.locked():
+            batch_lock.release()
 
 
 @bot_client.on_message((filters.private | filters.group | filters.channel) & filters.command("start"))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
@@ -1019,14 +1056,14 @@ async def flush_auto_batch_summary(user_id: int) -> None:
             f"❌ נכשלו: {state.get('failed', 0)}",
         ]
 
-        saved_items = list(state.get("saved_items", []))
-        if saved_items:
-            lines.extend(["", "✅ **קבצים שנשמרו בקטלוג:**"])
-            preview_limit = 20
-            for item in saved_items[:preview_limit]:
-                lines.append(_format_saved_item_line(item))
-            if len(saved_items) > preview_limit:
-                lines.append(f"... ועוד {len(saved_items) - preview_limit} פריטים שנשמרו בקטלוג.")
+        groups = state.get("groups", {})
+        if groups:
+            lines.extend(["", "📚 **פירוט לפי סדרה:**"])
+            for series_title, counts in sorted(groups.items(), key=lambda item: item[0].casefold()):
+                lines.append(
+                    f"• {series_title}: {counts.get('uploaded', 0)} נשמרו, "
+                    f"{counts.get('failed', 0)} נכשלו"
+                )
 
         if state.get("failed", 0):
             lines.extend(["", "⚠️ **קבצים שנכשלו:**"])
@@ -1050,6 +1087,7 @@ def queue_auto_batch_summary(user_id: int, message: Message) -> None:
             "failed": 0,
             "failed_episodes": [],
             "saved_items": [],
+            "groups": {},
             "last_message": message,
         },
     )
@@ -1195,13 +1233,16 @@ def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
     season_number = None
     episode_number = None
     for line in lines[:3]:
-        for pattern_index, pattern in enumerate(episode_patterns):
+        for pattern in episode_patterns:
             match = re.match(pattern, line, flags=re.IGNORECASE)
             if not match:
                 continue
             episode_match = match
-            season_number = int(match.group(2)) if pattern_index < 2 else int(match.group(1))
-            episode_number = int(match.group(3)) if pattern_index < 2 else int(match.group(2))
+            # Every episode pattern captures title, season, episode in groups
+            # 1, 2, 3. The previous special case treated the title as the
+            # season for SxxEyy and crashed on common filenames.
+            season_number = int(match.group(2))
+            episode_number = int(match.group(3))
             break
         if episode_match:
             break

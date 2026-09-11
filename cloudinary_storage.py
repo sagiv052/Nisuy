@@ -11,6 +11,7 @@ None on an upload failure so the bot can fall back to its Telegram stream URL.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
 import os
@@ -28,8 +29,8 @@ log = logging.getLogger(__name__)
 
 
 class CloudinaryStorage:
-    def __init__(self) -> None:
-        self.cloudinary_url = os.environ.get("CLOUDINARY_URL", "").strip()
+    def __init__(self, cloudinary_url: str = "") -> None:
+        self.cloudinary_url = (cloudinary_url or os.environ.get("CLOUDINARY_URL", "")).strip()
         self.folder = os.environ.get("CLOUDINARY_FOLDER", "telegram-stream-bot").strip("/")
         self.chunk_size = max(5 * 1024 * 1024, int(os.environ.get("CLOUDINARY_CHUNK_SIZE", str(20 * 1024 * 1024))))
         self.enabled = bool(self.cloudinary_url)
@@ -131,7 +132,6 @@ class CloudinaryStorage:
         """Download one Telegram message to a temporary path and upload it."""
         if not self.enabled:
             return None
-        import asyncio
         import tempfile
 
         suffix = Path(file_name or "file").suffix
@@ -142,13 +142,29 @@ class CloudinaryStorage:
             if not downloaded:
                 raise RuntimeError("Telegram did not return a downloaded file path")
             public_id = f"chat_{chat_id}/message_{message_id}"
-            return await asyncio.to_thread(
-                self.upload,
-                str(downloaded),
-                public_id=public_id,
-                mime_type=mime_type,
-                file_name=file_name,
-            )
+            last_error: Optional[BaseException] = None
+            for attempt in range(1, 4):
+                try:
+                    return await asyncio.to_thread(
+                        self.upload,
+                        str(downloaded),
+                        public_id=public_id,
+                        mime_type=mime_type,
+                        file_name=file_name,
+                    )
+                except Exception as error:
+                    last_error = error
+                    if attempt >= 3:
+                        raise
+                    delay = float(2 ** (attempt - 1))
+                    log.warning(
+                        "Cloudinary upload attempt %s/3 failed for %s/%s; retrying in %.1fs: %s",
+                        attempt, chat_id, message_id, delay, error,
+                    )
+                    await asyncio.sleep(delay)
+            if last_error is not None:
+                raise last_error
+            return None
         except Exception:
             log.exception("Cloudinary upload failed for Telegram message %s/%s", chat_id, message_id)
             return None
