@@ -745,6 +745,7 @@ async def handle_media(client: Client, message: Message):
                 )
                 CATALOG.attach_upload(upload_id, episode_id)
                 state["uploaded"] = int(state.get("uploaded", 0)) + 1
+                state["summary_sent"] = False
                 state.setdefault("saved_items", []).append(
                     {
                         "kind": "episode",
@@ -759,8 +760,12 @@ async def handle_media(client: Client, message: Message):
                         "release_year": None,
                     }
                 )
+                state["last_message"] = message
+                auto_batch_states[user_id] = state
+                queue_auto_batch_summary(user_id, message)
             except Exception:
                 state["failed"] = int(state.get("failed", 0)) + 1
+                state["summary_sent"] = False
                 state.setdefault("failed_episodes", []).append(
                     (int(state["season"]), episode_number)
                 )
@@ -768,6 +773,9 @@ async def handle_media(client: Client, message: Message):
                     "Failed to save season %s episode %s",
                     state["season"], episode_number,
                 )
+                state["last_message"] = message
+                auto_batch_states[user_id] = state
+                queue_auto_batch_summary(user_id, message)
             state["next_episode"] = episode_number + 1
             return
         if state and state.get("step") == "media":
@@ -909,10 +917,14 @@ async def handle_media(client: Client, message: Message):
         if is_batch_upload and state:
             episode_number = int(state["next_episode"])
             state["failed"] = int(state.get("failed", 0)) + 1
+            state["summary_sent"] = False
             state.setdefault("failed_episodes", []).append(
                 (int(state["season"]), episode_number)
             )
             state["next_episode"] = episode_number + 1
+            state["last_message"] = message
+            auto_batch_states[user_id] = state
+            queue_auto_batch_summary(user_id, message)
             log.error(
                 "Failed to process season %s episode %s: %s",
                 state["season"], episode_number, e,
@@ -1068,6 +1080,7 @@ async def flush_auto_batch_summary(user_id: int) -> None:
 
         message = state.get("last_message")
         if message is not None:
+            state["summary_sent"] = True
             await reply(message, "\n".join(lines))
     finally:
         auto_batch_tasks.pop(user_id, None)
@@ -2175,6 +2188,10 @@ async def text_router(client: Client, message: Message):
     if text in {"✅ סיום", "סיום"} and user_id in user_states:
         state = user_states[user_id]
         if is_batch_upload_state(state):
+            if state.get("summary_sent"):
+                user_states.pop(user_id, None)
+                await reply(message, "✅ העלאת העונה הסתיימה.")
+                return
             uploaded = int(state.get("uploaded", 0))
             failed = int(state.get("failed", 0))
             total = uploaded + failed
