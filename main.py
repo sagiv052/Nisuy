@@ -712,10 +712,6 @@ async def handle_media(client: Client, message: Message):
         # Telegram can deliver several media updates concurrently. Serialize a
         # user's explicit season upload so next_episode cannot be duplicated.
         await batch_lock.acquire()
-    wait_msg: Optional[Message] = None
-    if not is_batch_upload:
-        wait_msg = await cast(Any, message).reply_text("⏳ מעבד...")
-
     try:
         media     = message.video or message.audio or message.document or message.video_note
         file_name = getattr(media, "file_name", "קובץ")
@@ -774,8 +770,6 @@ async def handle_media(client: Client, message: Message):
                 )
             state["next_episode"] = episode_number + 1
             return
-        if wait_msg is None:
-            raise RuntimeError("Upload status message was not created")
         if state and state.get("step") == "media":
             data = state["data"]
             if state["flow"] == "movie":
@@ -797,7 +791,7 @@ async def handle_media(client: Client, message: Message):
                     f"**{data['series_title']}**."
                 )
             user_states.pop(user_id, None)
-            await wait_msg.edit_text(result)
+            await reply(message, result)
             return
 
         # Captions are preferred, but common filenames such as
@@ -862,7 +856,7 @@ async def handle_media(client: Client, message: Message):
                 queue_auto_batch_summary(user_id, message)
                 return
             if result_message:
-                await wait_msg.edit_text(result_message)
+                await reply(message, result_message)
                 return
 
         partial = parse_partial_episode_reference(metadata_text)
@@ -874,7 +868,7 @@ async def handle_media(client: Client, message: Message):
         if is_channel:
             stats["links_generated"] += 1
             stats["last_file"] = f"{file_name} ({size_mb}MB)"
-            await wait_msg.edit_text(
+            await reply(message,
                 "✅ הקובץ התקבל בערוץ ונוצר קישור סטרימינג.\n\n"
                 f"🔗 `{stream_url}`\n\n"
                 "כדי לשייך אותו לקטלוג, צרף כיתוב לפוסט בפורמט:\n"
@@ -892,7 +886,7 @@ async def handle_media(client: Client, message: Message):
                 "episode": partial["episode"],
             },
         }
-        await wait_msg.edit_text(
+        await reply(message,
             "📺 קיבלתי את הקובץ.\n"
             "לאיזו סדרה הוא שייך? כתוב את שם הסדרה."
         )
@@ -901,7 +895,7 @@ async def handle_media(client: Client, message: Message):
         stats["links_generated"] += 1
         stats["last_file"] = f"{file_name} ({size_mb}MB)"
 
-        await wait_msg.edit_text(
+        await reply(message,
             f"✅ **קישור סטרימינג מוכן!**\n\n"
             f"📄 קובץ: `{file_name}`\n"
             f"📦 גודל: {size_mb} MB\n\n"
@@ -923,8 +917,8 @@ async def handle_media(client: Client, message: Message):
                 "Failed to process season %s episode %s: %s",
                 state["season"], episode_number, e,
             )
-        elif wait_msg is not None:
-            await wait_msg.edit_text(f"❌ שגיאה: {str(e)}")
+        else:
+            await reply(message, f"❌ שגיאה: {str(e)}")
     finally:
         if batch_lock is not None and batch_lock.locked():
             batch_lock.release()
@@ -1921,9 +1915,22 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
         data["seasons"] = seasons
         state["step"] = "browse_season"
         await show_item_preview(message, item)
+        all_episodes = CATALOG.list_episodes(int(item["id"]))
+        episode_counts = {
+            int(season["season_number"]): sum(
+                1 for episode in all_episodes
+                if int(episode["season_number"]) == int(season["season_number"])
+            )
+            for season in seasons
+        }
         await reply(message, "\n".join(
             [f"📺 {item['title']} — בחר עונה לפי מספר:", ""]
-            + [f"{index}. עונה {season['season_number']}" for index, season in enumerate(seasons, 1)]
+            + [
+                f"{index}. עונה {season['season_number']} — "
+                f"{episode_counts.get(int(season['season_number']), 0)} "
+                f"{'פרק' if episode_counts.get(int(season['season_number']), 0) == 1 else 'פרקים'}"
+                for index, season in enumerate(seasons, 1)
+            ]
         ))
     elif step == "browse_preview":
         if text == "▶️ צפה עכשיו":
