@@ -210,7 +210,7 @@ WATCH_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 EDIT_FIELD_KEYBOARD = ReplyKeyboardMarkup(
-    [["✏️ שם", "📝 תקציר"], ["📅 שנת יציאה", "🖼️ פוסטר"], ["⬅️ אחורה"]],
+    [["✏️ שם", "📝 תקציר"], ["📅 שנת יציאה", "🖼️ פוסטר"], ["🎭 זאנר", "⬅️ אחורה"]],
     resize_keyboard=True,
 )
 MANAGEMENT_KEYBOARD = ReplyKeyboardMarkup(
@@ -916,6 +916,11 @@ async def reply(message: Message, text: str, keyboard: Any = MAIN_KEYBOARD) -> N
 
 def is_skip_word(text: str) -> bool:
     return text.strip().casefold().replace("⏭️ ", "") in SKIP_WORDS
+
+
+def is_back_command(text: str) -> bool:
+    normalized = text.strip().casefold()
+    return normalized in {"⬅️ חזרה", "⬅️ אחורה", "חזרה", "אחורה", "back", "cancel"}
 
 
 def parse_episode_reference(text: str) -> tuple[str, Optional[int], Optional[int]]:
@@ -1857,11 +1862,16 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
                 state["step"] = "season"
                 await reply(message, "🔢 מה מספר העונה? אפשר גם לכתוב למשל `פאודה עונה 1 פרק 1`.")
     elif step == "edit_field":
+        if is_back_command(text):
+            user_states.pop(user_id, None)
+            await reply(message, "🔄 חזרתי לתפריט הראשי.", MAIN_KEYBOARD)
+            return
         fields = {
             "✏️ שם": "title", "שם": "title", "name": "title",
             "📝 תקציר": "summary", "תקציר": "summary", "summary": "summary",
             "📅 שנת יציאה": "release_year", "שנת יציאה": "release_year", "year": "release_year",
             "🖼️ פוסטר": "poster_url", "פוסטר": "poster_url", "poster": "poster_url",
+            "🎭 זאנר": "genre", "זאנר": "genre", "genre": "genre",
         }
         field = fields.get(text.casefold())
         if not field:
@@ -1874,21 +1884,28 @@ async def handle_state(message: Message, state: dict[str, Any], text: str) -> No
             "summary": "📝 מה התקציר החדש?",
             "release_year": "📅 מה שנת היציאה החדשה?",
             "poster_url": "🖼️ שלח קישור לפוסטר החדש.",
+            "genre": "🎭 מה הזאנר החדש? אפשר לכתוב `דלג` כדי להישאר בלי שינוי.",
         }
         await reply(message, prompts[field], OPTIONAL_FIELD_KEYBOARD)
     elif step == "edit_value":
+        if is_back_command(text):
+            state["step"] = "edit_field"
+            await reply(message, "✏️ בחר מה לערוך עכשיו:", EDIT_FIELD_KEYBOARD)
+            return
         field = data["edit_field"]
         if is_skip_word(text):
-            user_states.pop(user_id, None)
-            await reply(message, "✅ העריכה בוטלה.")
+            state["step"] = "edit_field"
+            await reply(message, "✏️ בחר מה לערוך עכשיו:", EDIT_FIELD_KEYBOARD)
             return
         if field == "release_year" and not text.isdigit():
             await reply(message, "❓ השנה צריכה להיות מספר. נסה שוב.", OPTIONAL_FIELD_KEYBOARD)
             return
         value: Any = int(text) if field == "release_year" else text
         CATALOG.update_item(data["item_id"], **{field: value})
-        user_states.pop(user_id, None)
-        await reply(message, "✅ העדכון נשמר בהצלחה.")
+        state["step"] = "edit_field"
+        item = CATALOG.get_item(int(data["item_id"]))
+        title = item["title"] if item else "הפריט"
+        await reply(message, f"✅ העדכון נשמר בהצלחה עבור **{title}**. בחר עוד שדה לעריכה:", EDIT_FIELD_KEYBOARD)
     elif step == "season":
         if not text.isdigit():
             await reply(message, "🔢 מספר עונה חייב להיות מספר. נסה שוב.")
@@ -2027,7 +2044,7 @@ async def text_router(client: Client, message: Message):
         "✅ אשר קבוצה": "add_group", "✅ אשר ערוץ": "add_channel",
         "🗑️ הסר צ׳אט": "remove_chat", "📋 רשימות ניהול": "management_list",
     }
-    if text in {"⬅️ חזרה", "🔄 רענן"}:
+    if text in {"🔄 רענן"} or is_back_command(text):
         user_states.pop(user_id, None)
         await cast(Any, message).reply_text("🔄 התפריט רוענן.", reply_markup=MAIN_KEYBOARD)
     elif text == "❌ ביטול":
