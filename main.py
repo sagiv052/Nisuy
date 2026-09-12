@@ -161,6 +161,7 @@ CATALOG.add_admin(OWNER_USER_ID)
 CATALOG.add_user(OWNER_USER_ID, OWNER_USER_ID)
 ADMIN_USER_IDS = set(CATALOG.list_admins()) | {OWNER_USER_ID}
 user_states: dict[int, dict[str, Any]] = {}
+pending_metadata_by_user: dict[int, dict[str, Any]] = {}
 auto_batch_states: dict[int, dict[str, Any]] = {}
 auto_batch_tasks: dict[int, asyncio.Task[None]] = {}
 auto_batch_locks: dict[int, asyncio.Lock] = {}
@@ -743,6 +744,21 @@ async def _upload_to_cloudinary_in_background(
     )
 
 
+@bot_client.on_message((filters.private | filters.group | filters.channel) & filters.photo, group=1)  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
+async def handle_photo_metadata(client: Client, message: Message):
+    if await reject_unauthorized(message):
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    metadata_text = (message.caption or "").strip()
+    if not metadata_text:
+        return
+    parsed_caption = parse_media_caption(metadata_text)
+    if not parsed_caption:
+        return
+    pending_metadata_by_user[user_id] = parsed_caption
+    await reply(message, "✅ שמרתי את פרטי הסדרה/הפוסטר. אפשר לשלוח עכשיו את הקבצים.")
+
+
 @bot_client.on_message((filters.private | filters.group | filters.channel) & (filters.video | filters.audio | filters.document | filters.video_note))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
 async def handle_media(client: Client, message: Message):
     if await reject_unauthorized(message):
@@ -859,7 +875,10 @@ async def handle_media(client: Client, message: Message):
         metadata_text = message.caption or re.sub(
             r"[._]+", " ", Path(file_name or "").stem
         )
+        pending_metadata = pending_metadata_by_user.get(user_id)
         parsed_caption = parse_media_caption(metadata_text)
+        if pending_metadata:
+            parsed_caption = merge_pending_metadata(parsed_caption, pending_metadata)
         if parsed_caption:
             auto_batch_lock: Optional[asyncio.Lock] = None
             if parsed_caption.get("kind") == "episode":
@@ -1158,6 +1177,34 @@ def parse_series_season_reference(text: str) -> tuple[str, Optional[int]]:
     return match.group(1).strip(), int(match.group(2))
 
 
+def looks_like_metadata(text: str) -> bool:
+    if not text or len(text) < 20:
+        return False
+    lowered = text.casefold()
+    if re.search(r"(?:עונה|season)\s*\d+", lowered):
+        return True
+    if re.search(r"(?:פרק|episode|ep)\s*\d+", lowered):
+        return True
+    return bool(re.search(r"(?:ז['׳]?אנר|genre|איכות|quality|תקציר|summary|שנת\s+יציאה|release\s+year)", lowered))
+
+
+def merge_pending_metadata(
+    parsed_caption: Optional[dict[str, Any]],
+    pending_metadata: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if pending_metadata is None:
+        return parsed_caption
+    if parsed_caption is None:
+        return dict(pending_metadata)
+
+    merged = dict(pending_metadata)
+    for key in ("kind", "title_candidates", "season", "episode", "quality", "genre", "summary", "year", "poster_url"):
+        value = parsed_caption.get(key)
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
 def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
     lines = [
         re.sub(
@@ -1214,6 +1261,10 @@ def parse_media_caption(caption: str) -> Optional[dict[str, Any]]:
         poster_match = re.match(r"(?:פוסטר|poster)\s*:?\s*(https?://\S+)", line, flags=re.IGNORECASE)
         if poster_match:
             poster_url = poster_match.group(1).strip()
+        else:
+            url_match = re.search(r"https?://\S+", line)
+            if url_match and not line.casefold().startswith(("תקציר", "summary", "מקור", "source")):
+                poster_url = url_match.group(0).strip()
         year_match = re.search(r"(?:שנת\s+יציאה|release\s+year|year)\s*:?\s*(\d{4})\b", line, flags=re.IGNORECASE)
         if year_match:
             year = int(year_match.group(1))
@@ -2181,6 +2232,12 @@ async def text_router(client: Client, message: Message):
         return
     text = (message.text or "").strip()
     user_id = message.from_user.id if message.from_user else 0
+    if looks_like_metadata(text):
+        parsed_caption = parse_media_caption(text)
+        if parsed_caption:
+            pending_metadata_by_user[user_id] = parsed_caption
+            await reply(message, "✅ שמרתי את פרטי הסדרה/הפוסטר. אפשר לשלוח עכשיו את הקבצים.")
+            return
     if text.startswith("/"):
         command = text.split()[0].split("@")[0].lower()
         commands = {
