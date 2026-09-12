@@ -46,6 +46,7 @@ from memory_cache import ChunkMemoryCache
 from stream_utils import RangeNotSatisfiable, content_disposition_filename, parse_range
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 load_dotenv()
@@ -119,32 +120,84 @@ stats: dict[str, Any] = {
 }
 
 def _catalog_database_path() -> str:
-    configured_path = Path(os.environ.get("CATALOG_DB", "catalog.db"))
+    configured_raw = os.environ.get("CATALOG_DB", "").strip()
+    configured_path = Path(configured_raw) if configured_raw else Path("catalog.db")
 
-    persistent_path = Path("/var/data/catalog.db")
-    if configured_path in {Path("catalog.db"), Path("/tmp/catalog.db")}:
+    candidate_paths = [configured_path]
+    candidate_roots = [
+        Path("data"),
+        Path.cwd() / "data",
+        Path("/var/data"),
+        Path("/tmp"),
+    ]
+
+    for root in candidate_roots:
+        candidate_paths.append(root / "catalog.db")
+
+    seen_paths: set[Path] = set()
+    for candidate in candidate_paths:
+        candidate = candidate.expanduser()
+        if candidate in seen_paths:
+            continue
+        seen_paths.add(candidate)
+
         try:
-            persistent_path.parent.mkdir(parents=True, exist_ok=True)
-            if os.access(persistent_path.parent, os.W_OK):
-                log.info("Using persistent catalog storage at %s", persistent_path)
-                return str(persistent_path)
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            if os.access(candidate.parent, os.W_OK):
+                if candidate != configured_path:
+                    log.info("Using catalog storage at %s", candidate)
+                return str(candidate)
         except OSError as error:
-            log.warning("Persistent catalog path %s is unavailable (%s); falling back to %s", persistent_path, error, configured_path)
+            log.info("Catalog storage path %s is unavailable (%s); trying next candidate", candidate, error)
 
+    fallback_path = Path("/tmp/catalog.db")
     try:
-        configured_path.parent.mkdir(parents=True, exist_ok=True)
-        if not os.access(configured_path.parent, os.W_OK):
-            raise PermissionError(f"Directory is not writable: {configured_path.parent}")
-        return str(configured_path)
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.access(fallback_path.parent, os.W_OK):
+            log.info("Using fallback catalog storage at %s", fallback_path)
+            return str(fallback_path)
     except OSError as error:
-        fallback_path = Path("/tmp/catalog.db")
-        log.warning("Catalog path %s is unavailable (%s); using %s", configured_path, error, fallback_path)
-        return str(fallback_path)
+        log.warning("Could not create fallback catalog storage at %s (%s)", fallback_path, error)
+
+    return str(configured_path)
 
 
 CATALOG_DB_PATH = _catalog_database_path()
 if not DATABASE_URL and CLOUDINARY_STORAGE.restore_catalog(CATALOG_DB_PATH):
     log.info("Using restored Cloudinary catalog at %s", CATALOG_DB_PATH)
+
+
+def _pyrogram_workdir() -> str:
+    configured = (os.environ.get("SESSION_DIR") or os.environ.get("DATA_DIR") or "").strip()
+    candidates: list[Path] = []
+
+    if configured:
+        candidates.append(Path(configured))
+
+    # Prefer a writable directory under the workspace for local runs, but keep
+    # the common container path as a fallback when it exists and is writable.
+    candidates.extend(
+        [
+            Path("data"),
+            Path("/var/data"),
+            Path.cwd() / "data",
+        ]
+    )
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            if os.access(candidate, os.W_OK):
+                return str(candidate)
+        except OSError:
+            continue
+
+    return str(Path.cwd() / "data")
+
+
+PYROGRAM_WORKDIR = _pyrogram_workdir()
+log.info("Using Pyrogram session workdir %s", PYROGRAM_WORKDIR)
+
 CATALOG = Catalog(CATALOG_DB_PATH, database_url=DATABASE_URL)
 if CATALOG.is_postgres:
     log.info("Using PostgreSQL catalog from DATABASE_URL")
@@ -236,7 +289,8 @@ bot_client = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True,
+    workdir=PYROGRAM_WORKDIR,
+    in_memory=False,
 )
 
 
