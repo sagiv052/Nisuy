@@ -15,6 +15,7 @@ COPY --from=builder /install /usr/local
 RUN useradd -m -u 1000 appuser
 # העתקת הקוד והגדרת בעלות למשתמש החדש
 COPY --chown=appuser . /app
+RUN mkdir -p /app/data && chown appuser:appuser /app/data
 
 USER appuser
 ENV PATH="/home/appuser/.local/bin:$PATH"

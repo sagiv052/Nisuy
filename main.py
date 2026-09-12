@@ -172,27 +172,43 @@ def _pyrogram_workdir() -> str:
     candidates: list[Path] = []
 
     if configured:
-        candidates.append(Path(configured))
+        candidates.append(Path(configured).expanduser())
 
-    # Prefer a writable directory under the workspace for local runs, but keep
-    # the common container path as a fallback when it exists and is writable.
+    # Prefer a writable directory under the app workspace first, then fall back
+    # to the familiar container locations when needed.
     candidates.extend(
         [
-            Path("data"),
-            Path("/var/data"),
             Path.cwd() / "data",
+            Path("/app/data"),
+            Path("/var/data"),
+            Path("/tmp"),
         ]
     )
 
+    seen_paths: set[Path] = set()
     for candidate in candidates:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            if os.access(candidate, os.W_OK):
-                return str(candidate)
-        except OSError:
-            continue
+        absolute_candidate = candidate.expanduser()
+        if not absolute_candidate.is_absolute():
+            absolute_candidate = (Path.cwd() / absolute_candidate).resolve()
 
-    return str(Path.cwd() / "data")
+        if absolute_candidate in seen_paths:
+            continue
+        seen_paths.add(absolute_candidate)
+
+        try:
+            absolute_candidate.mkdir(parents=True, exist_ok=True)
+            test_file = absolute_candidate / ".pyrogram-write-test"
+            test_file.touch(exist_ok=True)
+            test_file.unlink(missing_ok=True)
+            log.info("Using Pyrogram session workdir %s", absolute_candidate)
+            return str(absolute_candidate)
+        except OSError as error:
+            log.info("Pyrogram workdir %s is unavailable (%s); trying next candidate", absolute_candidate, error)
+
+    fallback_path = (Path.cwd() / "data").resolve()
+    fallback_path.mkdir(parents=True, exist_ok=True)
+    log.warning("Falling back to Pyrogram session workdir %s", fallback_path)
+    return str(fallback_path)
 
 
 PYROGRAM_WORKDIR = _pyrogram_workdir()
