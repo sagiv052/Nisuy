@@ -112,6 +112,20 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(episodes[2]["id"], missing_id)
             self.assertEqual(episodes[3]["quality"], "720p")
 
+    def test_upload_stream_url_can_be_updated_after_cloudinary_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(str(Path(directory) / "catalog.db"))
+            upload_id = catalog.save_upload("a.mp4", 10, "video/mp4", "telegram-url", 7, 8)
+            series_id = catalog.add_item("series", "Test Series")
+            episode_id = catalog.add_episode(series_id, 1, 1, "Episode 1", "telegram-url")
+            catalog.attach_upload(upload_id, episode_id)
+
+            catalog.update_upload_stream_url(upload_id, "cloudinary-url")
+
+            episodes = catalog.list_episodes(series_id, 1)
+            self.assertEqual(episodes[0]["stream_url"], "cloudinary-url")
+            self.assertEqual(catalog.list_uploads()[0]["stream_url"], "cloudinary-url")
+
     def test_admin_and_chat_management_is_persistent(self):
         with tempfile.TemporaryDirectory() as directory:
             catalog = Catalog(str(Path(directory) / "catalog.db"))

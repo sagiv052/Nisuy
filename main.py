@@ -698,6 +698,51 @@ async def dashboard():
 
 # ── Bot handler ───────────────────────────────────────────────────────────────
 
+async def _upload_to_cloudinary_in_background(
+    client: Client,
+    message: Message,
+    *,
+    upload_id: int,
+    chat_id: int,
+    message_id: int,
+    file_name: str,
+    mime_type: str,
+) -> None:
+    try:
+        async with upload_slots:
+            cloudinary_result = await CLOUDINARY_STORAGE.upload_downloaded_media(
+                client,
+                message,
+                chat_id=chat_id,
+                message_id=message_id,
+                file_name=file_name,
+                mime_type=mime_type,
+            )
+    except Exception:
+        log.exception(
+            "Background Cloudinary upload failed for Telegram message %s/%s",
+            chat_id,
+            message_id,
+        )
+        return
+
+    cloudinary_stream_url = CLOUDINARY_STORAGE.storage_url(cloudinary_result)
+    if not cloudinary_stream_url:
+        log.warning(
+            "Cloudinary background upload completed without a usable URL for %s/%s",
+            chat_id,
+            message_id,
+        )
+        return
+
+    CATALOG.update_upload_stream_url(upload_id, cloudinary_stream_url)
+    log.info(
+        "Cloudinary background upload finished for %s/%s; upgraded stream URL",
+        chat_id,
+        message_id,
+    )
+
+
 @bot_client.on_message((filters.private | filters.group | filters.channel) & (filters.video | filters.audio | filters.document | filters.video_note))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
 async def handle_media(client: Client, message: Message):
     if await reject_unauthorized(message):
@@ -718,24 +763,29 @@ async def handle_media(client: Client, message: Message):
         file_size = getattr(media, "file_size", 0)
         size_mb   = round(file_size / 1024 / 1024, 1)
 
-        # Upload a durable copy when Cloudinary is configured. If it fails,
-        # keep the existing Telegram MTProto stream as a safe fallback.
+        # Upload a durable copy when Cloudinary is configured, but do not block
+        # the Telegram reply on that slower background operation. We keep the
+        # direct MTProto stream URL as the immediate response and then upgrade the
+        # saved record in the background when Cloudinary finishes.
         telegram_stream_url = f"{BASE_URL}/stream/{message.chat.id}/{message.id}"
-        async with upload_slots:
-            cloudinary_result = await CLOUDINARY_STORAGE.upload_downloaded_media(
-                client,
-                message,
-                chat_id=int(message.chat.id),
-                message_id=int(message.id),
-                file_name=file_name,
-                mime_type=getattr(media, "mime_type", ""),
-            )
-        stream_url = CLOUDINARY_STORAGE.storage_url(cloudinary_result) or telegram_stream_url
+        stream_url = telegram_stream_url
 
         upload_id = CATALOG.save_upload(
             file_name, file_size, getattr(media, "mime_type", ""), stream_url,
             message.chat.id, message.id,
         )
+        if CLOUDINARY_STORAGE.enabled:
+            asyncio.create_task(
+                _upload_to_cloudinary_in_background(
+                    client,
+                    message,
+                    upload_id=upload_id,
+                    chat_id=int(message.chat.id),
+                    message_id=int(message.id),
+                    file_name=file_name,
+                    mime_type=getattr(media, "mime_type", ""),
+                )
+            )
         if state and state.get("step") == "batch_media":
             episode_number = int(state["next_episode"])
             try:
@@ -1019,28 +1069,6 @@ def is_back_command(text: str) -> bool:
     return normalized in {"⬅️ חזרה", "⬅️ אחורה", "חזרה", "אחורה", "back", "cancel"}
 
 
-def _format_saved_item_line(item: dict[str, Any]) -> str:
-    title = str(item.get("title") or "קובץ")
-    suffix_parts: list[str] = []
-    if item.get("season") is not None and item.get("episode") is not None:
-        suffix_parts.append(f"עונה {item['season']} פרק {item['episode']}")
-    if item.get("quality"):
-        suffix_parts.append(str(item.get("quality")))
-    if item.get("genre"):
-        suffix_parts.append(f"זאנר: {item['genre']}")
-    if item.get("release_year"):
-        suffix_parts.append(f"שנה: {item['release_year']}")
-    if item.get("summary"):
-        summary = re.sub(r"\s+", " ", str(item["summary"])).strip()
-        if len(summary) > 120:
-            summary = summary[:117] + "..."
-        suffix_parts.append(f"תקציר: {summary}")
-    if item.get("stream_url"):
-        suffix_parts.append(f"🔗 {item['stream_url']}")
-
-    if suffix_parts:
-        return f"• {title} | {' | '.join(suffix_parts)}"
-    return f"• {title}"
 
 
 async def flush_auto_batch_summary(user_id: int) -> None:

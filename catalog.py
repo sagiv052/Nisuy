@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -27,11 +28,15 @@ class Catalog:
     def _connect(self) -> Generator[Any, None, None]:
         if self.is_postgres:
             try:
-                import psycopg
-                from psycopg.rows import dict_row
+                psycopg_module = importlib.import_module("psycopg")
+                dict_row = importlib.import_module("psycopg.rows").dict_row
             except ImportError as exc:
                 raise RuntimeError("DATABASE_URL is set but psycopg is not installed") from exc
-            connection = psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=15)
+            connection: Any = psycopg_module.connect(
+                self.database_url,
+                row_factory=dict_row,
+                connect_timeout=15,
+            )
             try:
                 yield connection
                 connection.commit()
@@ -346,6 +351,25 @@ class Catalog:
         with self._connect() as connection:
             self._execute(connection, "UPDATE uploads SET catalog_item_id = ? WHERE id = ?", (catalog_item_id, upload_id))
 
+    def update_upload_stream_url(self, upload_id: int, stream_url: str) -> None:
+        with self._connect() as connection:
+            self._execute(connection, "UPDATE uploads SET stream_url = ? WHERE id = ?", (stream_url, upload_id))
+            upload = self._execute(connection, "SELECT catalog_item_id FROM uploads WHERE id = ?", (upload_id,)).fetchone()
+            if upload is None:
+                return
+            catalog_item_value = upload["catalog_item_id"] if self.is_postgres else upload[0]
+            if catalog_item_value is None:
+                return
+            catalog_item_id = int(catalog_item_value)
+
+            item_row = self._execute(connection, "SELECT id FROM items WHERE id = ?", (catalog_item_id,)).fetchone()
+            if item_row is not None:
+                self._execute(connection, "UPDATE items SET stream_url = ? WHERE id = ?", (stream_url, catalog_item_id))
+
+            episode_row = self._execute(connection, "SELECT id FROM episodes WHERE id = ?", (catalog_item_id,)).fetchone()
+            if episode_row is not None:
+                self._execute(connection, "UPDATE episodes SET stream_url = ? WHERE id = ?", (stream_url, catalog_item_id))
+
     def list_uploads(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as connection:
             return [dict(row) for row in self._execute(connection, "SELECT * FROM uploads ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()]
@@ -418,19 +442,19 @@ class Catalog:
 
     def integrity_report(self) -> dict[str, list[dict[str, Any]]]:
         with self._connect() as connection:
-            duplicate_rows = self._execute(connection, """SELECT kind, lower(trim(title)) AS normalized_title,
+            duplicate_rows: list[dict[str, Any]] = self._execute(connection, """SELECT kind, lower(trim(title)) AS normalized_title,
                 MIN(title) AS title, STRING_AGG(CAST(id AS TEXT), ',') AS item_ids, COUNT(*) AS count
                 FROM items GROUP BY kind, normalized_title HAVING COUNT(*) > 1 ORDER BY kind, normalized_title""").fetchall() if self.is_postgres else self._execute(connection, """SELECT kind, lower(trim(title)) AS normalized_title,
                 MIN(title) AS title, GROUP_CONCAT(id) AS item_ids, COUNT(*) AS count FROM items
                 GROUP BY kind, normalized_title HAVING COUNT(*) > 1 ORDER BY kind, normalized_title""").fetchall()
-            series_rows = self._execute(connection, """SELECT items.id AS series_id, items.title AS series_title,
+            series_rows: list[dict[str, Any]] = self._execute(connection, """SELECT items.id AS series_id, items.title AS series_title,
                 seasons.season_number, STRING_AGG(CAST(episodes.episode_number AS TEXT), ',') AS episode_numbers
                 FROM items JOIN seasons ON seasons.series_id = items.id LEFT JOIN episodes ON episodes.season_id = seasons.id
                 WHERE items.kind = 'series' GROUP BY items.id, items.title, seasons.season_number ORDER BY items.title, seasons.season_number""").fetchall() if self.is_postgres else self._execute(connection, """SELECT items.id AS series_id, items.title AS series_title,
                 seasons.season_number, GROUP_CONCAT(episodes.episode_number) AS episode_numbers FROM items
                 JOIN seasons ON seasons.series_id = items.id LEFT JOIN episodes ON episodes.season_id = seasons.id
                 WHERE items.kind = 'series' GROUP BY items.id, items.title, seasons.season_number ORDER BY items.title, seasons.season_number""").fetchall()
-        duplicates = [{"kind": row["kind"], "title": row["title"], "item_ids": sorted(int(value) for value in row["item_ids"].split(",")), "count": int(row["count"])} for row in duplicate_rows]
+        duplicates: list[dict[str, Any]] = [{"kind": row["kind"], "title": row["title"], "item_ids": sorted(int(value) for value in row["item_ids"].split(",")), "count": int(row["count"])} for row in duplicate_rows]
         missing_episodes: list[dict[str, Any]] = []
         for row in series_rows:
             if not row["episode_numbers"]:
