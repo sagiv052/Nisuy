@@ -1569,6 +1569,73 @@ def find_item(query: str, kind: Optional[str] = None) -> Optional[dict[str, Any]
     return exact[0] if exact else results[0]
 
 
+def attach_metadata_to_existing_catalog(parsed_caption: dict[str, Any]) -> Optional[str]:
+    raw_candidates = cast(list[Any], parsed_caption.get("title_candidates") or [])
+    if not raw_candidates:
+        return None
+
+    candidates: list[str] = []
+    for candidate in raw_candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            candidates.append(candidate.strip())
+
+    if not candidates:
+        return None
+
+    kind_value: Any = parsed_caption.get("kind")
+    kind = kind_value if isinstance(kind_value, str) else ""
+
+    item: Optional[dict[str, Any]] = None
+
+    if kind == "episode":
+        for candidate in candidates:
+            item = find_item(candidate, "series")
+            if item:
+                break
+    else:
+        for candidate in candidates:
+            item = find_item(candidate, kind)
+            if item:
+                break
+
+    if not item:
+        return None
+
+    item_id = int(item["id"])
+    updates: dict[str, Any] = {}
+    if parsed_caption.get("summary"):
+        updates["summary"] = parsed_caption["summary"]
+    if parsed_caption.get("year"):
+        updates["release_year"] = parsed_caption["year"]
+    if parsed_caption.get("poster_url"):
+        updates["poster_url"] = parsed_caption["poster_url"]
+    if parsed_caption.get("quality"):
+        updates["quality"] = parsed_caption["quality"]
+    if parsed_caption.get("genre"):
+        updates["genre"] = parsed_caption["genre"]
+
+    if updates:
+        CATALOG.update_item(item_id, **updates)
+
+    if kind == "episode":
+        existing_episodes = CATALOG.list_episodes(item_id)
+        for episode in existing_episodes:
+            quality = parsed_caption.get("quality", "")
+            if quality:
+                CATALOG.add_episode(
+                    item_id,
+                    int(episode["season_number"]),
+                    int(episode["episode_number"]),
+                    episode.get("title", f"פרק {episode['episode_number']}"),
+                    episode.get("stream_url", ""),
+                    quality,
+                )
+
+    if kind == "episode":
+        return f"✅ מצאתי סדרה קיימת ({item['title']}) והחברתי אליה את פרטי המידע החדש."
+    return f"✅ מצאתי {kind or 'פריט'} קיים ({item['title']}) והחברתי אליו את פרטי המידע החדש."
+
+
 async def show_list(message: Message) -> None:
     items = CATALOG.list_items()
     summary = CATALOG.summary()
@@ -2305,6 +2372,10 @@ async def text_router(client: Client, message: Message):
     if looks_like_metadata(text):
         parsed_caption = parse_media_caption(text)
         if parsed_caption:
+            existing_link_message = attach_metadata_to_existing_catalog(parsed_caption)
+            if existing_link_message:
+                await reply(message, existing_link_message)
+                return
             pending_metadata_by_user[user_id] = parsed_caption
             await reply(message, "✅ שמרתי את פרטי הסדרה/הפוסטר. אפשר לשלוח עכשיו את הקבצים.")
             return
